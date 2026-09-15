@@ -1,0 +1,16 @@
+# CMake build directories
+/build/
+/build-*/
+
+# VS Code local settings
+/.vscode/
+
+# Runtime / generated data
+/data/
+
+# Logs
+*.log
+
+# Editor temporary files
+*.swp
+*~

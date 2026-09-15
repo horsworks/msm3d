@@ -10,7 +10,7 @@ Under active development.
 ## Development Environment
 
 - Ubuntu 24.04 / WSL2
-- C++20
+- C++17
 - CMake
 - Ninja
 - GCC

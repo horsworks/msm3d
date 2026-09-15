@@ -6,32 +6,51 @@ project(
     LANGUAGES CXX
 )
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(CTest)
+find_package(Eigen3 REQUIRED)
+
+add_library(
+    msm3d
+    src/geometry.cpp
+    src/camera.cpp
+    src/phase.cpp
+)
+
+target_include_directories(
+    msm3d
+    PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(
+    msm3d
+    PUBLIC
+        Eigen3::Eigen
+)
+
+# tests
+enable_testing()
 
 add_executable(
-    msm3d_smoke_test
-    tests/smoke_test.cpp
+    test_geometry
+
+    tests/test_geometry.cpp
 )
 
-target_compile_features(
-    msm3d_smoke_test
+target_link_libraries(
+    test_geometry
+
     PRIVATE
-        cxx_std_17
+        msm3d
 )
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(
-        msm3d_smoke_test
-        PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-    )
-endif()
 
 add_test(
-    NAME msm3d.smoke
-    COMMAND msm3d_smoke_test
+    NAME geometry_test
+
+    COMMAND test_geometry
 )

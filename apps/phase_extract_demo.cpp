@@ -1,67 +1,83 @@
-#include "msm3d/phase.hpp"
+#include "msm3d/io/config.hpp"
+#include "msm3d/io/data_loader.hpp"
+#include "msm3d/phase_processor.hpp"
 
 #include <filesystem>
 #include <iostream>
+#include <string>
 #include <vector>
-#include <opencv2/imgcodecs.hpp>
 
-int main() {
+int main(int argc, char** argv) {
+  const std::string config_path =
+      (argc > 1) ? argv[1] : "./config/msm_calibration.yaml";
+
+  // 1. 加载配置
   msm3d::PhaseConfig config;
   try {
-    config = msm3d::loadPhaseConfig("./config/phase.yaml");
+    config = msm3d::loadPhaseConfig(config_path);
+    std::cout << "Loaded phase configuration from: " << config_path
+              << std::endl;
   } catch (const std::exception& e) {
-    std::cerr << "Load config failed: " << e.what() << std::endl;
+    std::cerr << "Failed to load configuration: " << e.what() << std::endl;
     return -1;
   }
 
-  // 优先使用配置文件中指定的输出路径，若为空则回退到默认路径
   const std::string output_dir =
       config.output_folder.empty() ? "./output/phase" : config.output_folder;
   std::filesystem::create_directories(output_dir);
 
-  msm3d::PhaseProcessor processor;
+  // 2. 全局单次扫描条纹图片并完成自然排序
+  std::vector<std::string> all_files;
+  try {
+    all_files = msm3d::DataLoader::scanDirectory(config.fringe_folder,
+                                                 config.pattern.extension);
+    std::cout << "Indexed " << all_files.size()
+              << " fringe images from: " << config.fringe_folder << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "Dataset indexing error: " << e.what() << std::endl;
+    return -1;
+  }
 
-  // 使用配置中的实际位姿数量替代硬编码的 27
+  // 3. 逐位姿求解绝对相位
+  const std::size_t num_freqs = config.pattern.frequencies.size();
+
   for (int pose = 0; pose < config.pose_count; ++pose) {
     try {
-      // 传入 config 供文件定位使用
-      auto data = processor.loadPoseImages(pose, config);
+      // 提取当前位姿下的条纹路径二维表: [freq_idx][step_idx]
+      const auto pose_paths = msm3d::DataLoader::loadPoseFringePaths(
+          all_files, pose, config.pattern);
 
-      std::vector<cv::Mat> wrapped;
-      wrapped.reserve(data.images.size());
+      std::vector<cv::Mat> wrapped_phases;
+      wrapped_phases.reserve(num_freqs);
 
-      for (const auto& freq_files : data.images) {
-        std::vector<cv::Mat> imgs;
-        imgs.reserve(freq_files.size());
-
-        for (const auto& file : freq_files) {
-          cv::Mat img = cv::imread(file, cv::IMREAD_GRAYSCALE);
-          if (img.empty()) {
-            std::cerr << "Warning: Failed to load image: " << file << std::endl;
-          }
-          imgs.push_back(img);
-        }
-
-        wrapped.push_back(processor.computeWrappedPhase(imgs));
+      // 解算各频率包裹相位
+      for (std::size_t f = 0; f < num_freqs; ++f) {
+        const auto step_images = msm3d::DataLoader::loadImages(pose_paths[f]);
+        wrapped_phases.push_back(
+            msm3d::PhaseProcessor::computeWrappedPhase(step_images));
       }
 
-      // 直接使用 config.frequencies，避免硬编码 {5, 3, 1}
-      cv::Mat phase =
-          processor.computeAbsolutePhase(wrapped, config.frequencies);
+      // 多频外差展开绝对相位
+      const cv::Mat abs_phase = msm3d::PhaseProcessor::computeAbsolutePhase(
+          wrapped_phases, config.pattern.frequencies);
 
+      // 保存绝对相位（开启无压缩写入，消除 I/O 阻塞）
       const std::string save_path =
           output_dir + "/pose_" + std::to_string(pose) + ".exr";
-      if (!processor.savePhaseEXR(phase, save_path)) {
+      if (!msm3d::PhaseProcessor::savePhaseEXR(abs_phase, save_path,
+                                               /*compress=*/false)) {
         std::cerr << "Failed to save EXR for pose " << pose << std::endl;
+      } else {
+        std::cout << "[OK] Pose " << pose
+                  << " successfully saved to: " << save_path << std::endl;
       }
 
-      std::cout << "Pose " << pose << " done" << std::endl;
-
     } catch (const std::exception& e) {
-      std::cerr << "Error processing pose " << pose << ": " << e.what()
+      std::cerr << "[FAIL] Error processing pose " << pose << ": " << e.what()
                 << std::endl;
     }
   }
 
+  std::cout << "\nAll poses finished successfully." << std::endl;
   return 0;
 }

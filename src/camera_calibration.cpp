@@ -1,25 +1,14 @@
 #include "msm3d/camera_calibration.hpp"
 
-#include <yaml-cpp/yaml.h>
-
 #include <algorithm>
 #include <cmath>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace msm3d {
 namespace {
-
-// 通用辅助模板：若键存在则直接读取赋值并覆盖目标值，不存在则保留原默认值
-template <typename T>
-void readField(const YAML::Node& node, const char* key, T& target) {
-  if (node && node[key]) {
-    target = node[key].as<T>();
-  }
-}
 
 void validateBoard(const CalibrationBoard& board) {
   if (board.columns <= 1 || board.rows <= 1) {
@@ -33,27 +22,13 @@ void validateBoard(const CalibrationBoard& board) {
   }
 }
 
-CalibrationPattern parsePattern(const std::string& pattern) {
-  if (pattern == "chessboard") {
-    return CalibrationPattern::kChessboard;
-  }
-  if (pattern == "circles") {
-    return CalibrationPattern::kSymmetricCircles;
-  }
-  if (pattern == "asymmetric_circles") {
-    return CalibrationPattern::kAsymmetricCircles;
-  }
-
-  throw std::invalid_argument("Unknown calibration pattern: " + pattern);
-}
-
 cv::Mat convertToGray(const cv::Mat& image) {
   if (image.empty()) {
     throw std::invalid_argument("Calibration image must not be empty.");
   }
 
   if (image.channels() == 1) {
-    return image;  // 避免不必要的整图深度拷贝
+    return image;  // 单通道直接复用，避免整图深拷贝
   }
 
   cv::Mat gray;
@@ -93,101 +68,6 @@ cv::Ptr<cv::SimpleBlobDetector> createCircleDetector(
 }
 
 }  // namespace
-
-CameraCalibrationConfig loadCameraCalibrationConfig(
-    const std::string& config_path) {
-  YAML::Node root;
-  try {
-    root = YAML::LoadFile(config_path);
-  } catch (const YAML::Exception& e) {
-    throw std::runtime_error(
-        "Failed to open/parse camera calibration config: " + config_path +
-        " (" + e.what() + ")");
-  }
-
-  CameraCalibrationConfig config;
-
-  // input
-  const auto input_node = root["input"];
-  readField(input_node, "image_dir", config.image_dir);
-
-  // board
-  const auto board_node = root["board"];
-  if (board_node && board_node["pattern"]) {
-    config.board.pattern =
-        parsePattern(board_node["pattern"].as<std::string>());
-  }
-  readField(board_node, "columns", config.board.columns);
-  readField(board_node, "rows", config.board.rows);
-  readField(board_node, "spacing", config.board.spacing);
-
-  // circle_detector
-  const auto detector_node = root["circle_detector"];
-  if (detector_node) {
-    readField(detector_node, "min_threshold",
-              config.circle_detector.min_threshold);
-    readField(detector_node, "max_threshold",
-              config.circle_detector.max_threshold);
-    readField(detector_node, "threshold_step",
-              config.circle_detector.threshold_step);
-
-    if (detector_node["min_repeatability"]) {
-      int rep = detector_node["min_repeatability"].as<int>();
-      config.circle_detector.min_repeatability =
-          static_cast<std::size_t>(std::max(rep, 1));
-    }
-
-    readField(detector_node, "min_dist_between_blobs",
-              config.circle_detector.min_dist_between_blobs);
-    readField(detector_node, "filter_by_area",
-              config.circle_detector.filter_by_area);
-    readField(detector_node, "min_area", config.circle_detector.min_area);
-    readField(detector_node, "max_area", config.circle_detector.max_area);
-    readField(detector_node, "filter_by_circularity",
-              config.circle_detector.filter_by_circularity);
-    readField(detector_node, "min_circularity",
-              config.circle_detector.min_circularity);
-    readField(detector_node, "filter_by_convexity",
-              config.circle_detector.filter_by_convexity);
-    readField(detector_node, "min_convexity",
-              config.circle_detector.min_convexity);
-    readField(detector_node, "filter_by_inertia",
-              config.circle_detector.filter_by_inertia);
-    readField(detector_node, "min_inertia_ratio",
-              config.circle_detector.min_inertia_ratio);
-    readField(detector_node, "filter_by_color",
-              config.circle_detector.filter_by_color);
-
-    if (detector_node["blob_color"]) {
-      int color = detector_node["blob_color"].as<int>();
-      config.circle_detector.blob_color =
-          static_cast<unsigned char>(std::clamp(color, 0, 255));
-    }
-  }
-
-  // calibration
-  const auto calibration_node = root["calibration"];
-  readField(calibration_node, "fix_k3", config.calibration.fix_k3);
-
-  // output
-  const auto output_node = root["output"];
-  readField(output_node, "result_file", config.result_file);
-  readField(output_node, "detection_dir", config.detection_dir);
-  readField(output_node, "blob_dir", config.blob_dir);
-  readField(output_node, "save_detection_debug", config.save_detection_debug);
-  readField(output_node, "save_blob_debug", config.save_blob_debug);
-
-  validateBoard(config.board);
-
-  if (config.image_dir.empty()) {
-    throw std::runtime_error("Camera calibration image directory is empty.");
-  }
-  if (config.result_file.empty()) {
-    throw std::runtime_error("Camera calibration result file is empty.");
-  }
-
-  return config;
-}
 
 std::vector<cv::Point3f> generateCalibrationObjectPoints(
     const CalibrationBoard& board) {
@@ -249,6 +129,7 @@ CalibrationDetectionResult detectCalibrationPoints(
     return result;
   }
 
+  // 尝试反色重检（应对黑底白圆与白底黑圆场景）
   cv::Mat inverted_gray;
   cv::bitwise_not(gray, inverted_gray);
 
@@ -266,9 +147,9 @@ CalibrationDetectionResult detectCalibrationPoints(
     return result;
   }
 
+  // 若均未检出完整标定板，保留斑点数量更接近期望数量的结果用于调试可视化
   const std::size_t expected_count =
       static_cast<std::size_t>(board.columns * board.rows);
-
   const auto orig_diff =
       std::abs(static_cast<long long>(result.blob_keypoints.size()) -
                static_cast<long long>(expected_count));

@@ -1,130 +1,156 @@
 #include "msm3d/camera_calibration.hpp"
+#include "msm3d/io/config.hpp"
+#include "msm3d/io/data_loader.hpp"
 
-#include <opencv2/opencv.hpp>
-
-#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <string>
 #include <vector>
 
-static std::vector<std::string> collectImages(const std::string& folder) {
-  std::vector<std::string> files;
+int main(int argc, char** argv) {
+  const std::string config_path =
+      (argc > 1) ? argv[1] : "./config/camera_calibration.yaml";
 
-  for (const auto& entry : std::filesystem::directory_iterator(folder)) {
-    if (!entry.is_regular_file()) {
-      continue;
-    }
-
-    const auto path = entry.path().string();
-
-    if (path.find(".png") != std::string::npos ||
-        path.find(".jpg") != std::string::npos ||
-        path.find(".bmp") != std::string::npos) {
-      files.push_back(path);
-    }
+  // 1. 加载配置
+  msm3d::CameraCalibrationConfig config;
+  try {
+    config = msm3d::loadCameraCalibrationConfig(config_path);
+    std::cout << "Loaded configuration from: " << config_path << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to load configuration: " << e.what() << std::endl;
+    return -1;
   }
 
-  std::sort(files.begin(), files.end());
-
-  return files;
-}
-
-static void saveDetectionImage(
-    const std::string& filename, const cv::Mat& image,
-    const msm3d::CalibrationDetectionResult& detection,
-    const std::string& output_dir) {
-  cv::Mat debug;
-
-  if (image.channels() == 1) {
-    cv::cvtColor(image, debug, cv::COLOR_GRAY2BGR);
-  } else {
-    debug = image.clone();
+  // 2. 利用 DataLoader
+  // 统一索引并自然排序标定图像（替代原先手写的目录遍历与排序）
+  std::vector<std::string> image_paths;
+  try {
+    image_paths =
+        msm3d::DataLoader::loadCameraCalibImagePaths(config.image_dir);
+    std::cout << "Found " << image_paths.size()
+              << " calibration images in: " << config.image_dir << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to load calibration images: " << e.what() << std::endl;
+    return -1;
   }
 
-  if (detection.found) {
-    cv::drawChessboardCorners(
-        debug, cv::Size(static_cast<int>(detection.points.size()), 1),
-        detection.points, true);
-
-    cv::drawKeypoints(debug, detection.blob_keypoints, debug,
-                      cv::Scalar(0, 255, 0));
+  if (image_paths.empty()) {
+    std::cerr << "No valid calibration images found in: " << config.image_dir
+              << std::endl;
+    return -1;
   }
 
-  const std::filesystem::path path(filename);
+  // 3. 创建调试输出目录
+  if (config.save_detection_debug && !config.detection_dir.empty()) {
+    std::filesystem::create_directories(config.detection_dir);
+  }
+  if (config.save_blob_debug && !config.blob_dir.empty()) {
+    std::filesystem::create_directories(config.blob_dir);
+  }
 
-  const std::string output =
-      output_dir + "/" + path.stem().string() + "_detect.png";
+  const auto object_points_pattern =
+      msm3d::generateCalibrationObjectPoints(config.board);
+  const cv::Size pattern_size(config.board.columns, config.board.rows);
 
-  cv::imwrite(output, debug);
-}
+  std::vector<std::vector<cv::Point3f>> all_object_points;
+  std::vector<std::vector<cv::Point2f>> all_image_points;
+  cv::Size image_size(0, 0);
 
-int main() {
-  using namespace msm3d;
-
-  CameraCalibrationConfig config =
-      loadCameraCalibrationConfig("./config/camera_calibration.yaml");
-
-  std::filesystem::create_directories(config.detection_dir);
-
-  std::filesystem::create_directories(config.blob_dir);
-
-  const auto image_files = collectImages(config.image_dir);
-
-  std::vector<std::vector<cv::Point3f>> object_points;
-
-  std::vector<std::vector<cv::Point2f>> image_points;
-
-  const auto board_points = generateCalibrationObjectPoints(config.board);
-
-  cv::Size image_size;
-
-  for (const auto& file : image_files) {
-    cv::Mat image = cv::imread(file);
-
+  // 4. 逐帧提取特征点
+  for (const auto& img_path : image_paths) {
+    cv::Mat image = cv::imread(img_path);
     if (image.empty()) {
+      std::cerr << "Failed to read image: " << img_path << std::endl;
       continue;
     }
 
-    image_size = image.size();
-
-    auto detection =
-        detectCalibrationPoints(image, config.board, config.circle_detector);
-
-    if (config.save_detection_debug) {
-      saveDetectionImage(file, image, detection, config.detection_dir);
+    if (image_size.width == 0 && image_size.height == 0) {
+      image_size = image.size();
     }
 
-    if (!detection.found) {
-      std::cout << "Detection failed: " << file << std::endl;
+    const auto result = msm3d::detectCalibrationPoints(image, config.board,
+                                                       config.circle_detector);
 
-      continue;
+    const std::string filename =
+        std::filesystem::path(img_path).filename().string();
+
+    if (result.found) {
+      all_object_points.push_back(object_points_pattern);
+      all_image_points.push_back(result.points);
+      std::cout << "[OK] Pattern detected in: " << filename << std::endl;
+
+      if (config.save_detection_debug && !config.detection_dir.empty()) {
+        cv::Mat debug_img = image.clone();
+        cv::drawChessboardCorners(debug_img, pattern_size, result.points, true);
+        cv::imwrite(config.detection_dir + "/" + filename, debug_img);
+      }
+    } else {
+      std::cout << "[FAIL] Failed to detect pattern in: " << filename
+                << std::endl;
     }
 
-    object_points.push_back(board_points);
-
-    image_points.push_back(detection.points);
-
-    std::cout << "Detection success: " << file << std::endl;
+    if (config.save_blob_debug && !config.blob_dir.empty() &&
+        !result.blob_keypoints.empty()) {
+      cv::Mat blob_img;
+      cv::drawKeypoints(image, result.blob_keypoints, blob_img,
+                        cv::Scalar(0, 0, 255),
+                        cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+      cv::imwrite(config.blob_dir + "/" + filename, blob_img);
+    }
   }
 
-  auto result = calibrateCamera(object_points, image_points, image_size,
-                                config.calibration);
+  std::cout << "\nValid views detected: " << all_image_points.size() << " / "
+            << image_paths.size() << std::endl;
 
-  std::cout << "RMS: " << result.rms << std::endl;
+  if (all_image_points.size() < 3) {
+    std::cerr << "Error: Camera calibration requires at least 3 valid views."
+              << std::endl;
+    return -1;
+  }
 
-  std::cout << "Reprojection error: " << result.reprojection_error << std::endl;
+  // 5. 标定解算
+  std::cout << "Optimizing camera parameters..." << std::endl;
+  const auto calib_result = msm3d::calibrateCamera(
+      all_object_points, all_image_points, image_size, config.calibration);
+
+  std::cout << "\n--- Calibration Results ---" << std::endl;
+  std::cout << "Image size: " << image_size.width << " x " << image_size.height
+            << std::endl;
+  std::cout << "Overall RMS error: " << calib_result.rms << std::endl;
+  std::cout << "Mean reprojection error: " << calib_result.reprojection_error
+            << " px" << std::endl;
+  std::cout << "Camera Matrix (K):\n"
+            << calib_result.camera_matrix << std::endl;
+  std::cout << "Distortion Coefficients (D):\n"
+            << calib_result.distortion_coefficients << std::endl;
+
+  // 6. 保存标定结果
+  std::filesystem::path res_path(config.result_file);
+  if (res_path.has_parent_path()) {
+    std::filesystem::create_directories(res_path.parent_path());
+  }
 
   cv::FileStorage fs(config.result_file, cv::FileStorage::WRITE);
+  if (!fs.isOpened()) {
+    std::cerr << "Failed to open result file for writing: "
+              << config.result_file << std::endl;
+    return -1;
+  }
 
-  fs << "camera_matrix" << result.camera_matrix;
-
-  fs << "distortion_coefficients" << result.distortion_coefficients;
-
-  fs << "rms" << result.rms;
-
-  fs << "reprojection_error" << result.reprojection_error;
-
+  fs << "image_width" << image_size.width;
+  fs << "image_height" << image_size.height;
+  fs << "camera_matrix" << calib_result.camera_matrix;
+  fs << "distortion_coefficients" << calib_result.distortion_coefficients;
+  fs << "rms" << calib_result.rms;
+  fs << "reprojection_error" << calib_result.reprojection_error;
+  fs << "per_view_errors" << calib_result.per_view_errors;
   fs.release();
+
+  std::cout << "Calibration parameters successfully saved to: "
+            << config.result_file << std::endl;
 
   return 0;
 }

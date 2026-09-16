@@ -1,8 +1,9 @@
 #pragma once
 
-#include <cstddef>
 #include <opencv2/core.hpp>
 #include <opencv2/features2d.hpp>
+
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -17,34 +18,27 @@ enum class CalibrationPattern {
 struct CalibrationBoard {
   int columns = 0;
   int rows = 0;
-  double spacing = 0.0;
-
-  CalibrationPattern pattern = CalibrationPattern::kSymmetricCircles;
+  float spacing = 0.0f;
+  CalibrationPattern pattern = CalibrationPattern::kChessboard;
 };
 
 struct CircleDetectorParameters {
-  float min_threshold = 5.0F;
-  float max_threshold = 250.0F;
-  float threshold_step = 5.0F;
-
+  float min_threshold = 10.0f;
+  float max_threshold = 220.0f;
+  float threshold_step = 5.0f;
   std::size_t min_repeatability = 2;
-  float min_dist_between_blobs = 5.0F;
-
+  float min_dist_between_blobs = 10.0f;
   bool filter_by_area = true;
-  float min_area = 20.0F;
-  float max_area = 5000.0F;
-
-  bool filter_by_circularity = true;
-  float min_circularity = 0.35F;
-
-  bool filter_by_convexity = true;
-  float min_convexity = 0.60F;
-
+  float min_area = 25.0f;
+  float max_area = 5000.0f;
+  bool filter_by_circularity = false;
+  float min_circularity = 0.8f;
+  bool filter_by_convexity = false;
+  float min_convexity = 0.95f;
   bool filter_by_inertia = true;
-  float min_inertia_ratio = 0.10F;
-
-  bool filter_by_color = false;
-  unsigned char blob_color = 255;
+  float min_inertia_ratio = 0.1f;
+  bool filter_by_color = true;
+  unsigned char blob_color = 0;
 };
 
 struct CameraCalibrationOptions {
@@ -53,22 +47,18 @@ struct CameraCalibrationOptions {
 
 struct CameraCalibrationConfig {
   std::string image_dir;
-
   CalibrationBoard board;
   CircleDetectorParameters circle_detector;
   CameraCalibrationOptions calibration;
-
   std::string result_file;
   std::string detection_dir;
   std::string blob_dir;
-
-  bool save_detection_debug = true;
-  bool save_blob_debug = true;
+  bool save_detection_debug = false;
+  bool save_blob_debug = false;
 };
 
 struct CalibrationDetectionResult {
   bool found = false;
-
   std::vector<cv::Point2f> points;
   std::vector<cv::KeyPoint> blob_keypoints;
 };
@@ -76,30 +66,23 @@ struct CalibrationDetectionResult {
 struct CameraCalibrationResult {
   cv::Mat camera_matrix;
   cv::Mat distortion_coefficients;
-
   std::vector<cv::Mat> rotation_vectors;
   std::vector<cv::Mat> translation_vectors;
-
   double rms = 0.0;
-  double reprojection_error = 0.0;
-
   std::vector<double> per_view_errors;
+  double reprojection_error = 0.0;
 };
 
-[[nodiscard]]
-CameraCalibrationConfig loadCameraCalibrationConfig(
-    const std::string& config_path);
-
-[[nodiscard]]
+// 生成标定板在局部坐标系下的 3D 物理坐标
 std::vector<cv::Point3f> generateCalibrationObjectPoints(
     const CalibrationBoard& board);
 
-[[nodiscard]]
+// 单张图像特征点（棋盘格角点/圆心网格）检测
 CalibrationDetectionResult detectCalibrationPoints(
     const cv::Mat& image, const CalibrationBoard& board,
     const CircleDetectorParameters& detector_params);
 
-[[nodiscard]]
+// 多视角相机张正友标定解算
 CameraCalibrationResult calibrateCamera(
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,

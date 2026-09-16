@@ -1,5 +1,7 @@
 #include "msm3d/camera_calibration.hpp"
 
+#include <yaml-cpp/yaml.h>
+
 #include <algorithm>
 #include <cmath>
 #include <opencv2/calib3d.hpp>
@@ -11,7 +13,15 @@
 namespace msm3d {
 namespace {
 
-void ValidateBoard(const CalibrationBoard& board) {
+// 通用辅助模板：若键存在则直接读取赋值并覆盖目标值，不存在则保留原默认值
+template <typename T>
+void readField(const YAML::Node& node, const char* key, T& target) {
+  if (node && node[key]) {
+    target = node[key].as<T>();
+  }
+}
+
+void validateBoard(const CalibrationBoard& board) {
   if (board.columns <= 1 || board.rows <= 1) {
     throw std::invalid_argument(
         "Calibration board rows and columns must be greater than 1.");
@@ -23,29 +33,13 @@ void ValidateBoard(const CalibrationBoard& board) {
   }
 }
 
-bool ReadBool(const cv::FileNode& node, const std::string& name,
-              bool default_value) {
-  const cv::FileNode value_node = node[name];
-
-  if (value_node.empty()) {
-    return default_value;
-  }
-
-  int value = default_value ? 1 : 0;
-  value_node >> value;
-
-  return value != 0;
-}
-
-CalibrationPattern ParsePattern(const std::string& pattern) {
+CalibrationPattern parsePattern(const std::string& pattern) {
   if (pattern == "chessboard") {
     return CalibrationPattern::kChessboard;
   }
-
   if (pattern == "circles") {
     return CalibrationPattern::kSymmetricCircles;
   }
-
   if (pattern == "asymmetric_circles") {
     return CalibrationPattern::kAsymmetricCircles;
   }
@@ -53,17 +47,16 @@ CalibrationPattern ParsePattern(const std::string& pattern) {
   throw std::invalid_argument("Unknown calibration pattern: " + pattern);
 }
 
-cv::Mat ConvertToGray(const cv::Mat& image) {
+cv::Mat convertToGray(const cv::Mat& image) {
   if (image.empty()) {
     throw std::invalid_argument("Calibration image must not be empty.");
   }
 
   if (image.channels() == 1) {
-    return image.clone();
+    return image;  // 避免不必要的整图深度拷贝
   }
 
   cv::Mat gray;
-
   if (image.channels() == 3) {
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
   } else if (image.channels() == 4) {
@@ -75,40 +68,25 @@ cv::Mat ConvertToGray(const cv::Mat& image) {
   return gray;
 }
 
-cv::Ptr<cv::SimpleBlobDetector> CreateCircleDetector(
+cv::Ptr<cv::SimpleBlobDetector> createCircleDetector(
     const CircleDetectorParameters& detector_params) {
   cv::SimpleBlobDetector::Params params;
 
   params.minThreshold = detector_params.min_threshold;
-
   params.maxThreshold = detector_params.max_threshold;
-
   params.thresholdStep = detector_params.threshold_step;
-
   params.minRepeatability = detector_params.min_repeatability;
-
   params.minDistBetweenBlobs = detector_params.min_dist_between_blobs;
-
   params.filterByArea = detector_params.filter_by_area;
-
   params.minArea = detector_params.min_area;
-
   params.maxArea = detector_params.max_area;
-
   params.filterByCircularity = detector_params.filter_by_circularity;
-
   params.minCircularity = detector_params.min_circularity;
-
   params.filterByConvexity = detector_params.filter_by_convexity;
-
   params.minConvexity = detector_params.min_convexity;
-
   params.filterByInertia = detector_params.filter_by_inertia;
-
   params.minInertiaRatio = detector_params.min_inertia_ratio;
-
   params.filterByColor = detector_params.filter_by_color;
-
   params.blobColor = detector_params.blob_color;
 
   return cv::SimpleBlobDetector::create(params);
@@ -116,116 +94,94 @@ cv::Ptr<cv::SimpleBlobDetector> CreateCircleDetector(
 
 }  // namespace
 
-CameraCalibrationConfig LoadCameraCalibrationConfig(
+CameraCalibrationConfig loadCameraCalibrationConfig(
     const std::string& config_path) {
-  cv::FileStorage file_storage(config_path, cv::FileStorage::READ);
-
-  if (!file_storage.isOpened()) {
-    throw std::runtime_error("Failed to open camera calibration config: " +
-                             config_path);
+  YAML::Node root;
+  try {
+    root = YAML::LoadFile(config_path);
+  } catch (const YAML::Exception& e) {
+    throw std::runtime_error(
+        "Failed to open/parse camera calibration config: " + config_path +
+        " (" + e.what() + ")");
   }
 
   CameraCalibrationConfig config;
 
-  const cv::FileNode input_node = file_storage["input"];
+  // input
+  const auto input_node = root["input"];
+  readField(input_node, "image_dir", config.image_dir);
 
-  const cv::FileNode board_node = file_storage["board"];
+  // board
+  const auto board_node = root["board"];
+  if (board_node && board_node["pattern"]) {
+    config.board.pattern =
+        parsePattern(board_node["pattern"].as<std::string>());
+  }
+  readField(board_node, "columns", config.board.columns);
+  readField(board_node, "rows", config.board.rows);
+  readField(board_node, "spacing", config.board.spacing);
 
-  const cv::FileNode detector_node = file_storage["circle_detector"];
+  // circle_detector
+  const auto detector_node = root["circle_detector"];
+  if (detector_node) {
+    readField(detector_node, "min_threshold",
+              config.circle_detector.min_threshold);
+    readField(detector_node, "max_threshold",
+              config.circle_detector.max_threshold);
+    readField(detector_node, "threshold_step",
+              config.circle_detector.threshold_step);
 
-  const cv::FileNode calibration_node = file_storage["calibration"];
+    if (detector_node["min_repeatability"]) {
+      int rep = detector_node["min_repeatability"].as<int>();
+      config.circle_detector.min_repeatability =
+          static_cast<std::size_t>(std::max(rep, 1));
+    }
 
-  const cv::FileNode output_node = file_storage["output"];
+    readField(detector_node, "min_dist_between_blobs",
+              config.circle_detector.min_dist_between_blobs);
+    readField(detector_node, "filter_by_area",
+              config.circle_detector.filter_by_area);
+    readField(detector_node, "min_area", config.circle_detector.min_area);
+    readField(detector_node, "max_area", config.circle_detector.max_area);
+    readField(detector_node, "filter_by_circularity",
+              config.circle_detector.filter_by_circularity);
+    readField(detector_node, "min_circularity",
+              config.circle_detector.min_circularity);
+    readField(detector_node, "filter_by_convexity",
+              config.circle_detector.filter_by_convexity);
+    readField(detector_node, "min_convexity",
+              config.circle_detector.min_convexity);
+    readField(detector_node, "filter_by_inertia",
+              config.circle_detector.filter_by_inertia);
+    readField(detector_node, "min_inertia_ratio",
+              config.circle_detector.min_inertia_ratio);
+    readField(detector_node, "filter_by_color",
+              config.circle_detector.filter_by_color);
 
-  input_node["image_dir"] >> config.image_dir;
+    if (detector_node["blob_color"]) {
+      int color = detector_node["blob_color"].as<int>();
+      config.circle_detector.blob_color =
+          static_cast<unsigned char>(std::clamp(color, 0, 255));
+    }
+  }
 
-  std::string pattern;
+  // calibration
+  const auto calibration_node = root["calibration"];
+  readField(calibration_node, "fix_k3", config.calibration.fix_k3);
 
-  board_node["pattern"] >> pattern;
+  // output
+  const auto output_node = root["output"];
+  readField(output_node, "result_file", config.result_file);
+  readField(output_node, "detection_dir", config.detection_dir);
+  readField(output_node, "blob_dir", config.blob_dir);
+  readField(output_node, "save_detection_debug", config.save_detection_debug);
+  readField(output_node, "save_blob_debug", config.save_blob_debug);
 
-  board_node["columns"] >> config.board.columns;
-
-  board_node["rows"] >> config.board.rows;
-
-  board_node["spacing"] >> config.board.spacing;
-
-  config.board.pattern = ParsePattern(pattern);
-
-  detector_node["min_threshold"] >> config.circle_detector.min_threshold;
-
-  detector_node["max_threshold"] >> config.circle_detector.max_threshold;
-
-  detector_node["threshold_step"] >> config.circle_detector.threshold_step;
-
-  int min_repeatability =
-      static_cast<int>(config.circle_detector.min_repeatability);
-
-  detector_node["min_repeatability"] >> min_repeatability;
-
-  config.circle_detector.min_repeatability =
-      static_cast<std::size_t>(std::max(min_repeatability, 1));
-
-  detector_node["min_dist_between_blobs"] >>
-      config.circle_detector.min_dist_between_blobs;
-
-  config.circle_detector.filter_by_area = ReadBool(
-      detector_node, "filter_by_area", config.circle_detector.filter_by_area);
-
-  detector_node["min_area"] >> config.circle_detector.min_area;
-
-  detector_node["max_area"] >> config.circle_detector.max_area;
-
-  config.circle_detector.filter_by_circularity =
-      ReadBool(detector_node, "filter_by_circularity",
-               config.circle_detector.filter_by_circularity);
-
-  detector_node["min_circularity"] >> config.circle_detector.min_circularity;
-
-  config.circle_detector.filter_by_convexity =
-      ReadBool(detector_node, "filter_by_convexity",
-               config.circle_detector.filter_by_convexity);
-
-  detector_node["min_convexity"] >> config.circle_detector.min_convexity;
-
-  config.circle_detector.filter_by_inertia =
-      ReadBool(detector_node, "filter_by_inertia",
-               config.circle_detector.filter_by_inertia);
-
-  detector_node["min_inertia_ratio"] >>
-      config.circle_detector.min_inertia_ratio;
-
-  config.circle_detector.filter_by_color = ReadBool(
-      detector_node, "filter_by_color", config.circle_detector.filter_by_color);
-
-  int blob_color = static_cast<int>(config.circle_detector.blob_color);
-
-  detector_node["blob_color"] >> blob_color;
-
-  blob_color = std::clamp(blob_color, 0, 255);
-
-  config.circle_detector.blob_color = static_cast<unsigned char>(blob_color);
-
-  config.calibration.fix_k3 =
-      ReadBool(calibration_node, "fix_k3", config.calibration.fix_k3);
-
-  output_node["result_file"] >> config.result_file;
-
-  output_node["detection_dir"] >> config.detection_dir;
-
-  output_node["blob_dir"] >> config.blob_dir;
-
-  config.save_detection_debug = ReadBool(output_node, "save_detection_debug",
-                                         config.save_detection_debug);
-
-  config.save_blob_debug =
-      ReadBool(output_node, "save_blob_debug", config.save_blob_debug);
-
-  ValidateBoard(config.board);
+  validateBoard(config.board);
 
   if (config.image_dir.empty()) {
     throw std::runtime_error("Camera calibration image directory is empty.");
   }
-
   if (config.result_file.empty()) {
     throw std::runtime_error("Camera calibration result file is empty.");
   }
@@ -233,30 +189,21 @@ CameraCalibrationConfig LoadCameraCalibrationConfig(
   return config;
 }
 
-std::vector<cv::Point3f> GenerateCalibrationObjectPoints(
+std::vector<cv::Point3f> generateCalibrationObjectPoints(
     const CalibrationBoard& board) {
-  ValidateBoard(board);
+  validateBoard(board);
 
   std::vector<cv::Point3f> points;
-
   points.reserve(static_cast<std::size_t>(board.columns * board.rows));
 
+  const bool is_asymmetric =
+      (board.pattern == CalibrationPattern::kAsymmetricCircles);
+
   for (int row = 0; row < board.rows; ++row) {
-    for (int column = 0; column < board.columns; ++column) {
-      double x = 0.0;
-      double y = 0.0;
-
-      if (board.pattern == CalibrationPattern::kAsymmetricCircles) {
-        x = (2.0 * static_cast<double>(column) + static_cast<double>(row % 2)) *
-            board.spacing;
-
-        y = static_cast<double>(row) * board.spacing;
-      } else {
-        x = static_cast<double>(column) * board.spacing;
-
-        y = static_cast<double>(row) * board.spacing;
-      }
-
+    const double y = static_cast<double>(row) * board.spacing;
+    for (int col = 0; col < board.columns; ++col) {
+      double x = is_asymmetric ? (2.0 * col + (row % 2)) * board.spacing
+                               : col * board.spacing;
       points.emplace_back(static_cast<float>(x), static_cast<float>(y), 0.0F);
     }
   }
@@ -264,15 +211,13 @@ std::vector<cv::Point3f> GenerateCalibrationObjectPoints(
   return points;
 }
 
-CalibrationDetectionResult DetectCalibrationPoints(
+CalibrationDetectionResult detectCalibrationPoints(
     const cv::Mat& image, const CalibrationBoard& board,
     const CircleDetectorParameters& detector_params) {
-  ValidateBoard(board);
+  validateBoard(board);
 
-  const cv::Mat gray = ConvertToGray(image);
-
+  const cv::Mat gray = convertToGray(image);
   CalibrationDetectionResult result;
-
   const cv::Size pattern_size(board.columns, board.rows);
 
   if (board.pattern == CalibrationPattern::kChessboard) {
@@ -286,21 +231,16 @@ CalibrationDetectionResult DetectCalibrationPoints(
           cv::TermCriteria(cv::TermCriteria::EPS | cv::TermCriteria::MAX_ITER,
                            30, 0.001));
     }
-
     return result;
   }
 
-  const auto detector = CreateCircleDetector(detector_params);
-
+  const auto detector = createCircleDetector(detector_params);
   detector->detect(gray, result.blob_keypoints);
 
   int flags = cv::CALIB_CB_CLUSTERING;
-
-  if (board.pattern == CalibrationPattern::kSymmetricCircles) {
-    flags |= cv::CALIB_CB_SYMMETRIC_GRID;
-  } else {
-    flags |= cv::CALIB_CB_ASYMMETRIC_GRID;
-  }
+  flags |= (board.pattern == CalibrationPattern::kSymmetricCircles)
+               ? cv::CALIB_CB_SYMMETRIC_GRID
+               : cv::CALIB_CB_ASYMMETRIC_GRID;
 
   result.found =
       cv::findCirclesGrid(gray, pattern_size, result.points, flags, detector);
@@ -310,49 +250,40 @@ CalibrationDetectionResult DetectCalibrationPoints(
   }
 
   cv::Mat inverted_gray;
-
   cv::bitwise_not(gray, inverted_gray);
 
   std::vector<cv::KeyPoint> inverted_keypoints;
-
   detector->detect(inverted_gray, inverted_keypoints);
 
   std::vector<cv::Point2f> inverted_points;
-
   const bool inverted_found = cv::findCirclesGrid(
       inverted_gray, pattern_size, inverted_points, flags, detector);
 
   if (inverted_found) {
     result.found = true;
-
     result.points = std::move(inverted_points);
-
     result.blob_keypoints = std::move(inverted_keypoints);
-
     return result;
   }
 
   const std::size_t expected_count =
       static_cast<std::size_t>(board.columns * board.rows);
 
-  const auto original_difference =
-      result.blob_keypoints.size() > expected_count
-          ? result.blob_keypoints.size() - expected_count
-          : expected_count - result.blob_keypoints.size();
+  const auto orig_diff =
+      std::abs(static_cast<long long>(result.blob_keypoints.size()) -
+               static_cast<long long>(expected_count));
+  const auto inv_diff =
+      std::abs(static_cast<long long>(inverted_keypoints.size()) -
+               static_cast<long long>(expected_count));
 
-  const auto inverted_difference =
-      inverted_keypoints.size() > expected_count
-          ? inverted_keypoints.size() - expected_count
-          : expected_count - inverted_keypoints.size();
-
-  if (inverted_difference < original_difference) {
+  if (inv_diff < orig_diff) {
     result.blob_keypoints = std::move(inverted_keypoints);
   }
 
   return result;
 }
 
-CameraCalibrationResult CalibrateCamera(
+CameraCalibrationResult calibrateCamera(
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,
     const cv::Size& image_size, const CameraCalibrationOptions& options) {
@@ -382,13 +313,10 @@ CameraCalibrationResult CalibrateCamera(
   }
 
   CameraCalibrationResult result;
-
   result.camera_matrix = cv::Mat::eye(3, 3, CV_64F);
-
   result.distortion_coefficients = cv::Mat::zeros(1, 5, CV_64F);
 
   int calibration_flags = 0;
-
   if (options.fix_k3) {
     calibration_flags |= cv::CALIB_FIX_K3;
   }
@@ -422,7 +350,6 @@ CameraCalibrationResult CalibrateCamera(
     result.per_view_errors.push_back(view_error);
 
     total_squared_error += l2_error * l2_error;
-
     total_point_count += object_points[i].size();
   }
 

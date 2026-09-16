@@ -87,20 +87,20 @@ struct CameraCalibrationResult {
 };
 
 [[nodiscard]]
-CameraCalibrationConfig LoadCameraCalibrationConfig(
+CameraCalibrationConfig loadCameraCalibrationConfig(
     const std::string& config_path);
 
 [[nodiscard]]
-std::vector<cv::Point3f> GenerateCalibrationObjectPoints(
+std::vector<cv::Point3f> generateCalibrationObjectPoints(
     const CalibrationBoard& board);
 
 [[nodiscard]]
-CalibrationDetectionResult DetectCalibrationPoints(
+CalibrationDetectionResult detectCalibrationPoints(
     const cv::Mat& image, const CalibrationBoard& board,
     const CircleDetectorParameters& detector_params);
 
 [[nodiscard]]
-CameraCalibrationResult CalibrateCamera(
+CameraCalibrationResult calibrateCamera(
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,
     const cv::Size& image_size, const CameraCalibrationOptions& options);

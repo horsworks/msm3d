@@ -16,8 +16,6 @@ include_directories(
 add_library(msm3d
     src/camera_calibration.cpp
     src/phase.cpp
-    src/dataset.cpp
-    src/config.cpp
     src/geometry.cpp
 )
 
@@ -27,10 +25,10 @@ target_link_libraries(msm3d
     yaml-cpp
 )
 
-add_executable(camera_calibration_demo
-    apps/camera_calibration_demo.cpp
+add_executable(demo
+    apps/phase_extract_demo.cpp
 )
 
-target_link_libraries(camera_calibration_demo
+target_link_libraries(demo
     msm3d
 )

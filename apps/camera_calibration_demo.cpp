@@ -7,7 +7,7 @@
 #include <iostream>
 #include <vector>
 
-static std::vector<std::string> CollectImages(const std::string& folder) {
+static std::vector<std::string> collectImages(const std::string& folder) {
   std::vector<std::string> files;
 
   for (const auto& entry : std::filesystem::directory_iterator(folder)) {
@@ -29,7 +29,7 @@ static std::vector<std::string> CollectImages(const std::string& folder) {
   return files;
 }
 
-static void SaveDetectionImage(
+static void saveDetectionImage(
     const std::string& filename, const cv::Mat& image,
     const msm3d::CalibrationDetectionResult& detection,
     const std::string& output_dir) {
@@ -62,19 +62,19 @@ int main() {
   using namespace msm3d;
 
   CameraCalibrationConfig config =
-      LoadCameraCalibrationConfig("./config/camera_calibration.yaml");
+      loadCameraCalibrationConfig("./config/camera_calibration.yaml");
 
   std::filesystem::create_directories(config.detection_dir);
 
   std::filesystem::create_directories(config.blob_dir);
 
-  const auto image_files = CollectImages(config.image_dir);
+  const auto image_files = collectImages(config.image_dir);
 
   std::vector<std::vector<cv::Point3f>> object_points;
 
   std::vector<std::vector<cv::Point2f>> image_points;
 
-  const auto board_points = GenerateCalibrationObjectPoints(config.board);
+  const auto board_points = generateCalibrationObjectPoints(config.board);
 
   cv::Size image_size;
 
@@ -88,10 +88,10 @@ int main() {
     image_size = image.size();
 
     auto detection =
-        DetectCalibrationPoints(image, config.board, config.circle_detector);
+        detectCalibrationPoints(image, config.board, config.circle_detector);
 
     if (config.save_detection_debug) {
-      SaveDetectionImage(file, image, detection, config.detection_dir);
+      saveDetectionImage(file, image, detection, config.detection_dir);
     }
 
     if (!detection.found) {
@@ -107,7 +107,7 @@ int main() {
     std::cout << "Detection success: " << file << std::endl;
   }
 
-  auto result = CalibrateCamera(object_points, image_points, image_size,
+  auto result = calibrateCamera(object_points, image_points, image_size,
                                 config.calibration);
 
   std::cout << "RMS: " << result.rms << std::endl;

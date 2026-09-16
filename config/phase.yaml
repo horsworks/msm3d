@@ -1,0 +1,11 @@
+dataset:
+  fringe_folder: "./data/fringe"
+  pose_count: 27
+  extension: ".bmp"
+
+phase:
+  frequencies: [70, 64, 59]
+  steps: 24
+
+output:
+  phase_folder: "./output/phase"

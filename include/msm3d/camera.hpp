@@ -8,8 +8,7 @@ namespace msm3d {
 
 struct CameraModel {
   Eigen::Matrix3d intrinsic;
-
-  Eigen::Matrix<double, 5, 1> distortion;
+  Eigen::VectorXd distortion;
 };
 
 Ray3D pixelToRay(const CameraModel& camera, double u, double v);

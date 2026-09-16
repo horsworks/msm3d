@@ -2,6 +2,25 @@
 
 namespace msm3d {
 
+CameraModel convertCameraModel(const cv::Mat& camera_matrix,
+                               const cv::Mat& distortion) {
+  CameraModel model;
+
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      model.intrinsic(r, c) = camera_matrix.at<double>(r, c);
+    }
+  }
+
+  model.distortion.resize(distortion.total());
+
+  for (int i = 0; i < static_cast<int>(distortion.total()); ++i) {
+    model.distortion(i) = distortion.at<double>(i);
+  }
+
+  return model;
+}
+
 Ray3D pixelToRay(const CameraModel& camera, double u, double v) {
   Eigen::Vector3d direction;
 

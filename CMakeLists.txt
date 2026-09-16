@@ -25,3 +25,32 @@ target_link_libraries(msm3d
         Eigen3::Eigen
         ${OpenCV_LIBS}
 )
+
+add_executable(
+    phase_demo
+    apps/phase_demo.cpp
+)
+
+target_link_libraries(
+    phase_demo
+    PRIVATE
+    msm3d
+)
+
+enable_testing()
+
+add_executable(
+    test_phase
+    tests/test_phase.cpp
+)
+
+target_link_libraries(
+    test_phase
+    PRIVATE
+    msm3d
+)
+
+add_test(
+    NAME phase_test
+    COMMAND test_phase
+)

@@ -14,7 +14,10 @@ struct PhaseResult {
 
 class PhaseProcessor {
  public:
-  PhaseResult compute(const std::vector<cv::Mat>& images) const;
+  PhaseResult computePhase(const std::vector<cv::Mat>& images) const;
+
+ private:
+  cv::Mat computeConfidence(const cv::Mat& modulation) const;
 };
 
 }  // namespace msm3d

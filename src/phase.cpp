@@ -2,65 +2,68 @@
 
 #include <cmath>
 
-#include <opencv2/imgproc.hpp>
-
 namespace msm3d {
 
-PhaseResult PhaseProcessor::computePhase(
+cv::Mat PhaseProcessor::computeWrappedPhase(
     const std::vector<cv::Mat>& images) const {
-  PhaseResult result;
+  CV_Assert(!images.empty());
 
-  if (images.empty()) {
-    return result;
-  }
+  cv::Mat numerator = cv::Mat::zeros(images[0].size(), CV_64F);
 
-  const int rows = images[0].rows;
-  const int cols = images[0].cols;
+  cv::Mat denominator = cv::Mat::zeros(images[0].size(), CV_64F);
 
-  cv::Mat numerator = cv::Mat::zeros(rows, cols, CV_64F);
+  int count = static_cast<int>(images.size());
 
-  cv::Mat denominator = cv::Mat::zeros(rows, cols, CV_64F);
+  for (int k = 0; k < count; ++k) {
+    double delta = 2.0 * CV_PI * k / count;
 
-  cv::Mat modulation = cv::Mat::zeros(rows, cols, CV_64F);
-
-  const int n = static_cast<int>(images.size());
-
-  for (int k = 0; k < n; ++k) {
     cv::Mat image_double;
 
     images[k].convertTo(image_double, CV_64F);
 
-    const double delta = 2.0 * CV_PI * k / n;
-
-    numerator += image_double * (-std::sin(delta));
+    numerator += image_double * std::sin(delta);
 
     denominator += image_double * std::cos(delta);
   }
 
-  cv::phase(denominator, numerator, result.absolute_phase, false);
+  cv::Mat phase;
 
-  cv::Mat abs_num;
-  cv::Mat abs_den;
+  cv::phase(denominator, numerator, phase);
 
-  cv::absdiff(numerator, cv::Scalar(0), abs_num);
-
-  cv::absdiff(denominator, cv::Scalar(0), abs_den);
-
-  modulation = abs_num + abs_den;
-
-  result.confidence = computeConfidence(modulation);
-
-  result.valid_mask = result.confidence > 5e-2;
-
-  return result;
+  return phase;
 }
 
-cv::Mat PhaseProcessor::computeConfidence(const cv::Mat& modulation) const {
-  cv::Mat normalized;
+cv::Mat PhaseProcessor::computeAbsolutePhase(
+    const std::vector<cv::Mat>& wrapped_phases,
+    const std::vector<int>& frequencies) const {
+  CV_Assert(wrapped_phases.size() == frequencies.size());
 
-  cv::normalize(modulation, normalized, 0.0, 1.0, cv::NORM_MINMAX);
+  if (wrapped_phases.size() < 2) {
+    return wrapped_phases.front().clone();
+  }
 
-  return normalized;
+  return unwrapPair(wrapped_phases[0], wrapped_phases[1], frequencies[0],
+                    frequencies[1]);
+}
+
+cv::Mat PhaseProcessor::unwrapPair(const cv::Mat& phase1, const cv::Mat& phase2,
+                                   int frequency1, int frequency2) const {
+  cv::Mat result = cv::Mat::zeros(phase1.size(), CV_64F);
+
+  for (int y = 0; y < phase1.rows; ++y) {
+    for (int x = 0; x < phase1.cols; ++x) {
+      double p1 = phase1.at<double>(y, x);
+
+      double p2 = phase2.at<double>(y, x);
+
+      double k = std::round((frequency2 * p1 - frequency1 * p2) /
+                            (2.0 * CV_PI * (frequency1 - frequency2)));
+
+      result.at<double>(y, x) = p1 + 2.0 * CV_PI * k;
+    }
+  }
+
+  return result;
 }
 
 }  // namespace msm3d

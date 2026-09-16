@@ -1,23 +1,21 @@
 #pragma once
 
-#include <vector>
+#include <opencv2/opencv.hpp>
 
-#include <opencv2/core.hpp>
+#include <vector>
 
 namespace msm3d {
 
-struct PhaseResult {
-  cv::Mat absolute_phase;
-  cv::Mat confidence;
-  cv::Mat valid_mask;
-};
-
 class PhaseProcessor {
  public:
-  PhaseResult computePhase(const std::vector<cv::Mat>& images) const;
+  cv::Mat computeWrappedPhase(const std::vector<cv::Mat>& images) const;
+
+  cv::Mat computeAbsolutePhase(const std::vector<cv::Mat>& wrapped_phases,
+                               const std::vector<int>& frequencies) const;
 
  private:
-  cv::Mat computeConfidence(const cv::Mat& modulation) const;
+  cv::Mat unwrapPair(const cv::Mat& phase1, const cv::Mat& phase2,
+                     int frequency1, int frequency2) const;
 };
 
 }  // namespace msm3d

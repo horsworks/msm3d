@@ -4,26 +4,30 @@
 
 namespace msm3d {
 
-Ray3D::Ray3D(const Eigen::Vector3d& origin, const Eigen::Vector3d& direction)
-    : origin(origin), direction(direction.normalized()) {}
+double Plane::distance(const Eigen::Vector3d& point) const {
+  return normal.dot(point) + d;
+}
 
-Plane3D::Plane3D(const Eigen::Vector3d& normal, double d)
-    : normal(normal.normalized()), d(d) {}
-
-bool intersectRayPlane(const Ray3D& ray, const Plane3D& plane,
-                       Eigen::Vector3d& point) {
-  constexpr double kEpsilon = 1e-12;
-
+bool intersect(const Ray& ray, const Plane& plane, Eigen::Vector3d& point) {
   const double denom = plane.normal.dot(ray.direction);
 
-  if (std::abs(denom) < kEpsilon) {
+  if (std::abs(denom) < 1e-12) {
     return false;
   }
 
-  const double t = -(plane.normal.dot(ray.origin) + plane.d) / denom;
+  double lambda = -(plane.normal.dot(ray.origin) + plane.d) / denom;
 
-  point = ray.origin + t * ray.direction;
+  point = ray.origin + lambda * ray.direction;
+
   return true;
+}
+
+Eigen::Vector3d rodrigues(const Eigen::Vector3d& vector,
+                          const Eigen::Vector3d& axis, double angle) {
+  Eigen::Vector3d w = axis.normalized();
+
+  return vector * std::cos(angle) + w.cross(vector) * std::sin(angle) +
+         w * (w.dot(vector)) * (1.0 - std::cos(angle));
 }
 
 }  // namespace msm3d

@@ -1,25 +1,33 @@
 #pragma once
 
 #include <Eigen/Core>
-#include <Eigen/Geometry>
 
-namespace msm3d {
+namespace msm3d
+{
 
-struct Ray3D {
-  Eigen::Vector3d origin;
-  Eigen::Vector3d direction;
+struct Plane
+{
+    Eigen::Vector3d normal;
+    double d = 0.0;
 
-  Ray3D(const Eigen::Vector3d& origin, const Eigen::Vector3d& direction);
+    double distance(
+        const Eigen::Vector3d& point) const;
 };
 
-struct Plane3D {
-  Eigen::Vector3d normal;
-  double d;
-
-  Plane3D(const Eigen::Vector3d& normal, double d);
+struct Ray
+{
+    Eigen::Vector3d origin;
+    Eigen::Vector3d direction;
 };
 
-bool intersectRayPlane(const Ray3D& ray, const Plane3D& plane,
-                       Eigen::Vector3d& point);
+bool intersect(
+    const Ray& ray,
+    const Plane& plane,
+    Eigen::Vector3d& point);
 
-}  // namespace msm3d
+Eigen::Vector3d rodrigues(
+    const Eigen::Vector3d& vector,
+    const Eigen::Vector3d& axis,
+    double angle);
+
+}

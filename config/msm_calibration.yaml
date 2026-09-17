@@ -1,11 +1,28 @@
 dataset:
   fringe_folder: "./data/fringe"
-  pose_count: 27
   extension: ".bmp"
+  pose_count: 27
+  camera_param_file: "./output/camera_calibration/camera_calibration.yml"
+  train_poses: [5, 7, 14, 17]
+  test_poses: [2]
 
 phase:
-  frequencies: [70, 64, 59]
+  frequencies: [60, 55, 51]
   steps: 24
+  min_modulation: 8.0
+  median_filter_size: 3
+
+msm_calibration:
+  auto_phase_range: true
+  min_covisible_poses: 4
+  min_psi: 25.0
+  max_psi: 160.0
+  plane_count: 80                 # 采样等相位平面的离散数量
+  harmonic_order: 2              # 低阶谐波阶数
+  min_spread_ratio: 0.02         # 空间展宽比阈值 (lambda2 / lambda1)
+  max_thickness_ratio: 0.005     # 厚度比阈值 (lambda3 / lambda2)
+  max_plane_rms_mm: 0.5          # 单平面 Huber 拟合 RMS 门限 (mm)
 
 output:
   phase_folder: "./output/phase"
+  result_file: "./output/msm_calibration_result.yaml"

@@ -7,7 +7,7 @@ board:
   pattern: "circles"
   columns: 10
   rows: 8
-  spacing: 10.0
+  spacing: 5.0
 
 circle_detector:
   min_threshold: 15.0

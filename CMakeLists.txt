@@ -19,6 +19,7 @@ add_library(msm3d
     src/geometry.cpp
     src/io/config.cpp
     src/io/data_loader.cpp
+    src/msm_calibration.cpp
 )
 
 target_link_libraries(msm3d
@@ -27,10 +28,55 @@ target_link_libraries(msm3d
     yaml-cpp
 )
 
-add_executable(demo
+add_executable(cam_demo
     apps/camera_calibration_demo.cpp
 )
 
-target_link_libraries(demo
+target_link_libraries(cam_demo
+    PRIVATE
+    msm3d
+)
+
+add_executable(phase_demo
+    apps/phase_processor_demo.cpp
+)
+
+target_link_libraries(phase_demo
+    PRIVATE
+    msm3d
+)
+
+add_executable(iso_demo
+    apps/inspect_iso_phase.cpp
+)
+
+target_link_libraries(iso_demo
+    PRIVATE
+    msm3d
+)
+add_executable(phase_map_demo
+    apps/inspect_phase_map.cpp
+)
+
+target_link_libraries(phase_map_demo
+    PRIVATE
+    msm3d
+)
+
+add_executable(msm_demo
+    apps/msm_calibration_demo.cpp
+)
+
+target_link_libraries(msm_demo
+    PRIVATE
+    msm3d
+)
+
+add_executable(pose_optimizer 
+    apps/msm_pose_optimizer.cpp
+)
+
+target_link_libraries(pose_optimizer
+    PRIVATE
     msm3d
 )

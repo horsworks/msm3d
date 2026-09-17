@@ -169,6 +169,9 @@ PhaseConfig loadPhaseConfig(const std::string& config_path) {
     config.pattern.frequencies = phase["frequencies"].as<std::vector<int>>();
   }
 
+  readField(phase, "min_modulation", config.min_modulation);
+  readField(phase, "median_filter_size", config.median_filter_size);
+
   const auto output = root["output"];
   readField(output, "phase_folder", config.output_folder);
 
@@ -180,6 +183,105 @@ PhaseConfig loadPhaseConfig(const std::string& config_path) {
   }
   if (config.pattern.frequencies.empty()) {
     throw std::invalid_argument("Frequencies list must not be empty.");
+  }
+
+  return config;
+}
+
+CameraCalibrationResult loadCameraCalibrationResult(
+    const std::string& result_path) {
+  cv::FileStorage fs(result_path, cv::FileStorage::READ);
+  if (!fs.isOpened()) {
+    throw std::runtime_error("Failed to open camera calibration result file: " +
+                             result_path);
+  }
+
+  CameraCalibrationResult result;
+  fs["camera_matrix"] >> result.camera_matrix;
+  fs["distortion_coefficients"] >> result.distortion_coefficients;
+  fs["rms"] >> result.rms;
+  fs["reprojection_error"] >> result.reprojection_error;
+
+  const cv::FileNode rvecs_node = fs["rotation_vectors"];
+  if (rvecs_node.isSeq()) {
+    for (const auto& node : rvecs_node) {
+      cv::Mat rvec;
+      node >> rvec;
+      result.rotation_vectors.push_back(rvec);
+    }
+  }
+
+  const cv::FileNode tvecs_node = fs["translation_vectors"];
+  if (tvecs_node.isSeq()) {
+    for (const auto& node : tvecs_node) {
+      cv::Mat tvec;
+      node >> tvec;
+      result.translation_vectors.push_back(tvec);
+    }
+  }
+
+  if (result.camera_matrix.empty() || result.distortion_coefficients.empty()) {
+    throw std::runtime_error(
+        "Invalid camera calibration file: missing camera_matrix or "
+        "distortion_coefficients.");
+  }
+
+  return result;
+}
+
+MsmCalibrationConfig loadMsmCalibrationConfig(const std::string& config_path) {
+  YAML::Node root;
+  try {
+    root = YAML::LoadFile(config_path);
+  } catch (const YAML::Exception& e) {
+    throw std::runtime_error("Failed to open/parse MSM calibration config: " +
+                             config_path + " (" + e.what() + ")");
+  }
+
+  MsmCalibrationConfig config;
+
+  const auto dataset = root["dataset"];
+  readField(dataset, "camera_param_file", config.camera_param_file);
+  if (dataset && dataset["train_poses"] &&
+      dataset["train_poses"].IsSequence()) {
+    config.train_poses = dataset["train_poses"].as<std::vector<int>>();
+  }
+  if (dataset && dataset["test_poses"] && dataset["test_poses"].IsSequence()) {
+    config.test_poses = dataset["test_poses"].as<std::vector<int>>();
+  }
+
+  const auto msm = root["msm_calibration"];
+  readField(msm, "auto_phase_range", config.options.auto_phase_range);
+  readField(msm, "min_covisible_poses", config.options.min_covisible_poses);
+  readField(msm, "min_psi", config.options.min_psi);
+  readField(msm, "max_psi", config.options.max_psi);
+  readField(msm, "plane_count", config.options.plane_count);
+  readField(msm, "harmonic_order", config.options.harmonic_order);
+  readField(msm, "min_spread_ratio", config.options.min_spread_ratio);
+  readField(msm, "max_thickness_ratio", config.options.max_thickness_ratio);
+  readField(msm, "max_plane_rms_mm", config.options.max_plane_rms_mm);
+
+  const auto output = root["output"];
+  readField(output, "result_file", config.result_file);
+  readField(output, "phase_folder", config.phase_folder);
+
+  if (config.camera_param_file.empty()) {
+    throw std::runtime_error("camera_param_file is required in config.");
+  }
+  if (config.phase_folder.empty()) {
+    throw std::runtime_error("phase_folder is required in config.");
+  }
+  if (config.train_poses.empty()) {
+    throw std::invalid_argument("train_poses list must not be empty.");
+  }
+  if (config.options.min_psi >= config.options.max_psi) {
+    throw std::invalid_argument("min_psi must be strictly less than max_psi.");
+  }
+  if (config.options.plane_count < 10) {
+    throw std::invalid_argument("plane_count must be at least 10.");
+  }
+  if (config.options.harmonic_order < 0 || config.options.harmonic_order > 2) {
+    throw std::invalid_argument("harmonic_order must be 0, 1, or 2.");
   }
 
   return config;

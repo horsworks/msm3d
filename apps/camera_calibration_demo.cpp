@@ -144,6 +144,8 @@ int main(int argc, char** argv) {
   fs << "image_height" << image_size.height;
   fs << "camera_matrix" << calib_result.camera_matrix;
   fs << "distortion_coefficients" << calib_result.distortion_coefficients;
+  fs << "rotation_vectors" << calib_result.rotation_vectors;
+  fs << "translation_vectors" << calib_result.translation_vectors;
   fs << "rms" << calib_result.rms;
   fs << "reprojection_error" << calib_result.reprojection_error;
   fs << "per_view_errors" << calib_result.per_view_errors;

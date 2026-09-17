@@ -1,7 +1,6 @@
 #pragma once
 
 #include <opencv2/core.hpp>
-
 #include <string>
 #include <vector>
 
@@ -9,18 +8,25 @@ namespace msm3d {
 
 class PhaseProcessor {
  public:
-  // N 步相移计算包裹相位（输出范围 [0, 2*pi) 的 CV_64F 矩阵）
-  // 若 out_modulation !=
-  // nullptr，则额外计算并写回调制度图，否则跳过开方与额外内存分配
+  // N 步相移：求解包裹相位
   static cv::Mat computeWrappedPhase(const std::vector<cv::Mat>& images,
                                      cv::Mat* out_modulation = nullptr);
 
-  // 多频外差绝对相位解算（输入 3 组包裹相位矩阵与 3 个降序频率值）
+  // 外差解包裹 (保持兼容)
   static cv::Mat computeAbsolutePhase(
       const std::vector<cv::Mat>& wrapped_phases,
       const std::vector<int>& frequencies);
 
-  // 保存高动态范围浮点相位为 EXR 格式（支持开启/关闭压缩）
+  // 增强版外差解包裹：结合多频调制度进行信噪比截断 (暗区/黑圆点直接置为 NaN)
+  static cv::Mat computeAbsolutePhase(
+      const std::vector<cv::Mat>& wrapped_phases,
+      const std::vector<int>& frequencies,
+      const std::vector<cv::Mat>& modulations, double min_modulation = 8.0);
+
+  // 掩膜感知中值滤波 (消除激光微观毛刺，不污染 NaN 边界)
+  static cv::Mat filterPhaseNoise(const cv::Mat& phase, int kernel_size = 3);
+
+  // 5. 保存 EXR 绝对相位图 (保持原签名)
   static bool savePhaseEXR(const cv::Mat& phase, const std::string& filename,
                            bool compress = false);
 };

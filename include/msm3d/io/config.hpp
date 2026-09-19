@@ -2,6 +2,7 @@
 
 #include "msm3d/camera_calibration.hpp"
 #include "msm3d/msm_calibration.hpp"
+#include "msm3d/phase_processor.hpp"
 
 #include <string>
 #include <vector>
@@ -19,8 +20,16 @@ struct PhaseConfig {
   int pose_count = 0;
   FringePatternConfig pattern;
   std::string output_folder;
-  double min_modulation = 8.0;
+  PhaseQualityOptions quality;
+
+  // "none", "median", or "local_plane".
+  std::string phase_filter = "local_plane";
   int median_filter_size = 3;
+  int local_plane_filter_size = 3;
+  int local_plane_min_valid_neighbors = 5;
+  double local_plane_robust_scale_rad = 0.10;
+
+  bool save_confidence_map = true;
 };
 
 CameraCalibrationConfig loadCameraCalibrationConfig(

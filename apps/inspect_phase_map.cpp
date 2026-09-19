@@ -1,5 +1,7 @@
 #include "msm3d/msm_calibration.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -8,9 +10,33 @@
 #include <opencv2/imgproc.hpp>
 #include <vector>
 
+namespace {
+
+std::string inferConfidencePath(const std::string& phase_path) {
+  const std::filesystem::path path(phase_path);
+  const std::string name = path.filename().string();
+  const std::string prefix = "pose_";
+
+  if (name.rfind(prefix, 0) == 0) {
+    return (path.parent_path() / ("confidence_" + name)).string();
+  }
+
+  return {};
+}
+
+cv::Mat finiteMask(const cv::Mat& values) {
+  cv::Mat mask;
+  cv::compare(values, values, mask, cv::CMP_EQ);
+  return mask;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   const std::string phase_path =
       (argc > 1) ? argv[1] : "./output/phase/pose_5.exr";
+  const std::string confidence_path =
+      (argc > 2) ? argv[2] : inferConfidencePath(phase_path);
   const std::string out_dir = "./output/debug";
 
   if (!std::filesystem::exists(phase_path)) {
@@ -32,121 +58,116 @@ int main(int argc, char** argv) {
   }
   phase_f64.convertTo(phase_f64, CV_64F);
 
+  const cv::Mat valid_mask = finiteMask(phase_f64);
+  const int valid_pixels = cv::countNonZero(valid_mask);
+  const int total_pixels = phase_f64.rows * phase_f64.cols;
+
+  std::cout << "Image size: " << phase_f64.cols << " x " << phase_f64.rows
+            << std::endl;
+  std::cout << "Finite phase pixels: " << valid_pixels << " / " << total_pixels
+            << " (" << std::fixed << std::setprecision(2)
+            << 100.0 * valid_pixels / std::max(total_pixels, 1) << "%)"
+            << std::endl;
+
+  // Center-row phase profile.
   const int cols = phase_f64.cols;
   const int rows = phase_f64.rows;
-
-  std::cout << "Image size: " << cols << " x " << rows << std::endl;
-
-  // 1. 终端网格数值采样输出 (采样 5 行 x 6 列)
-  std::cout << "\n--- Spatial Phase Grid Samples (rad) ---" << std::endl;
-  std::cout << std::setw(8) << "y \\ x";
-  for (int x = 200; x < cols; x += 350) {
-    std::cout << std::setw(12) << ("x=" + std::to_string(x));
-  }
-  std::cout << std::endl;
-
-  for (int y = 200; y < rows; y += 250) {
-    std::cout << std::setw(8) << ("y=" + std::to_string(y));
-    const double* r_ptr = phase_f64.ptr<double>(y);
-    for (int x = 200; x < cols; x += 350) {
-      std::cout << std::setw(12) << std::fixed << std::setprecision(1)
-                << r_ptr[x];
-    }
-    std::cout << std::endl;
-  }
-
-  // 2. 生成中心扫描行 (y = rows / 2) 的截面曲线图
   const int mid_y = rows / 2;
   const double* mid_row = phase_f64.ptr<double>(mid_y);
 
   const int plot_w = 1000;
   const int plot_h = 500;
-  cv::Mat plot_img = cv::Mat::zeros(plot_h, plot_w, CV_8UC3);
-  plot_img.setTo(cv::Scalar(245, 245, 245));
+  cv::Mat plot_img(plot_h, plot_w, CV_8UC3, cv::Scalar(245, 245, 245));
 
-  // 确定有效纵坐标刻度范围 [0, 480]
-  const double max_plot_psi = 480.0;
-  auto to_screen = [&](int img_x, double psi) -> cv::Point {
-    const int sx = static_cast<int>(
-        static_cast<double>(img_x) / cols * (plot_w - 100) + 60);
-    const double clamped_psi = std::max(0.0, std::min(psi, max_plot_psi));
-    const int sy = static_cast<int>(
-        (plot_h - 60) - (clamped_psi / max_plot_psi) * (plot_h - 100));
+  double min_phase = 0.0;
+  double max_phase = 1.0;
+  cv::minMaxLoc(phase_f64, &min_phase, &max_phase, nullptr, nullptr,
+                valid_mask);
+  if (!(max_phase > min_phase)) {
+    max_phase = min_phase + 1.0;
+  }
+
+  auto to_screen = [&](int image_x, double phase) -> cv::Point {
+    const int sx = static_cast<int>(static_cast<double>(image_x) /
+                                        std::max(cols - 1, 1) * (plot_w - 100) +
+                                    60);
+    const double t =
+        std::clamp((phase - min_phase) / (max_phase - min_phase), 0.0, 1.0);
+    const int sy = static_cast<int>((plot_h - 60) - t * (plot_h - 100));
     return cv::Point(sx, sy);
   };
 
-  // 绘制坐标轴与网格线
   cv::line(plot_img, cv::Point(60, plot_h - 60),
            cv::Point(plot_w - 40, plot_h - 60), cv::Scalar(0, 0, 0), 2);
   cv::line(plot_img, cv::Point(60, 40), cv::Point(60, plot_h - 60),
            cv::Scalar(0, 0, 0), 2);
-  cv::putText(plot_img, "Phase (rad)", cv::Point(15, 30),
-              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
-  cv::putText(plot_img, "Image Column X (px)",
-              cv::Point(plot_w / 2 - 50, plot_h - 20), cv::FONT_HERSHEY_SIMPLEX,
-              0.5, cv::Scalar(0, 0, 0), 1);
 
-  for (double p = 0; p <= 450; p += 50) {
-    const cv::Point pt = to_screen(0, p);
-    cv::line(plot_img, cv::Point(55, pt.y), cv::Point(plot_w - 40, pt.y),
-             cv::Scalar(210, 210, 210), 1);
-    cv::putText(plot_img, std::to_string(static_cast<int>(p)),
-                cv::Point(20, pt.y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.45,
-                cv::Scalar(80, 80, 80), 1);
-  }
-
-  // 绘制中行相位变化曲线
   for (int x = 1; x < cols; ++x) {
-    const cv::Point p_prev = to_screen(x - 1, mid_row[x - 1]);
-    const cv::Point p_curr = to_screen(x, mid_row[x]);
-    cv::line(plot_img, p_prev, p_curr, cv::Scalar(200, 50, 0), 2);
+    if (!std::isfinite(mid_row[x - 1]) || !std::isfinite(mid_row[x])) {
+      continue;
+    }
+    cv::line(plot_img, to_screen(x - 1, mid_row[x - 1]),
+             to_screen(x, mid_row[x]), cv::Scalar(200, 50, 0), 2);
   }
 
-  // 3. 生成全视场等相位线概览图 (从 30 到 150，步长 30)
-  cv::Mat norm_phase, gray_8u, vis_contours;
-  cv::normalize(phase_f64, norm_phase, 0, 255, cv::NORM_MINMAX);
-  norm_phase.convertTo(gray_8u, CV_8U);
-  cv::applyColorMap(gray_8u, vis_contours, cv::COLORMAP_VIRIDIS);
+  // Full-field phase visualization with invalid pixels shown in black.
+  cv::Mat phase_for_vis = phase_f64.clone();
+  phase_for_vis.setTo(min_phase, ~valid_mask);
+  cv::Mat normalized;
+  phase_for_vis.convertTo(normalized, CV_64F, 255.0 / (max_phase - min_phase),
+                          -255.0 * min_phase / (max_phase - min_phase));
+  cv::Mat gray8;
+  normalized.convertTo(gray8, CV_8U);
+  cv::Mat phase_vis;
+  cv::applyColorMap(gray8, phase_vis, cv::COLORMAP_VIRIDIS);
+  phase_vis.setTo(cv::Scalar(0, 0, 0), ~valid_mask);
 
-  std::cout << "\n--- Extracting Full-Field Iso-Phase Contours ---"
-            << std::endl;
-  for (double target_psi = 30.0; target_psi <= 150.0; target_psi += 30.0) {
+  std::cout << "\n--- Iso-phase contours ---" << std::endl;
+  for (double target_psi = 30.0; target_psi <= 165.0; target_psi += 30.0) {
     const auto subpixels =
         msm3d::extractIsoPhaseSubpixels(phase_f64, target_psi);
     if (subpixels.empty()) {
       continue;
     }
 
-    std::cout << "Contour psi=" << std::setw(5) << target_psi
-              << " | points=" << subpixels.size() << " | x_mean="
-              << static_cast<int>(subpixels[subpixels.size() / 2].x)
-              << std::endl;
+    std::cout << "  psi=" << std::setw(6) << target_psi
+              << ", points=" << subpixels.size() << std::endl;
 
-    for (std::size_t k = 0; k < subpixels.size(); ++k) {
-      cv::circle(vis_contours, subpixels[k], 2, cv::Scalar(255, 255, 255), -1);
-      if (k > 0 && std::abs(subpixels[k].y - subpixels[k - 1].y) <= 3.0) {
-        cv::line(vis_contours, subpixels[k - 1], subpixels[k],
+    for (std::size_t i = 0; i < subpixels.size(); ++i) {
+      cv::circle(phase_vis, subpixels[i], 2, cv::Scalar(255, 255, 255), -1);
+      if (i > 0 && std::abs(subpixels[i].y - subpixels[i - 1].y) <= 3.0) {
+        cv::line(phase_vis, subpixels[i - 1], subpixels[i],
                  cv::Scalar(255, 255, 255), 2);
       }
     }
-
-    // 标注文字
-    const auto& mid_pt = subpixels[subpixels.size() / 2];
-    cv::putText(
-        vis_contours, std::to_string(static_cast<int>(target_psi)),
-        cv::Point(static_cast<int>(mid_pt.x) + 5, static_cast<int>(mid_pt.y)),
-        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
   }
 
   std::filesystem::create_directories(out_dir);
-  const std::string curve_path = out_dir + "/phase_profile_curve.png";
-  const std::string contour_path = out_dir + "/phase_contours_overview.png";
+  cv::imwrite(out_dir + "/phase_profile_curve.png", plot_img);
+  cv::imwrite(out_dir + "/phase_contours_overview.png", phase_vis);
 
-  cv::imwrite(curve_path, plot_img);
-  cv::imwrite(contour_path, vis_contours);
+  if (!confidence_path.empty() && std::filesystem::exists(confidence_path)) {
+    cv::Mat confidence = cv::imread(confidence_path, cv::IMREAD_UNCHANGED);
+    if (!confidence.empty()) {
+      if (confidence.channels() > 1) {
+        cv::extractChannel(confidence, confidence, 0);
+      }
+      confidence.convertTo(confidence, CV_64F);
 
-  std::cout << "\nSaved profile curve to: " << curve_path << std::endl;
-  std::cout << "Saved contour overview to: " << contour_path << std::endl;
+      cv::Mat confidence8;
+      confidence.convertTo(confidence8, CV_8U, 255.0);
+      cv::Mat confidence_vis;
+      cv::applyColorMap(confidence8, confidence_vis, cv::COLORMAP_TURBO);
+      confidence_vis.setTo(cv::Scalar(0, 0, 0), ~valid_mask);
+      cv::imwrite(out_dir + "/phase_confidence_overview.png", confidence_vis);
 
+      cv::Scalar mean_confidence = cv::mean(confidence, valid_mask);
+      std::cout << "Confidence map: " << confidence_path << std::endl;
+      std::cout << "Mean confidence over valid phase pixels: "
+                << mean_confidence[0] << std::endl;
+    }
+  }
+
+  std::cout << "Saved debug images to: " << out_dir << std::endl;
   return 0;
 }

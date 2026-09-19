@@ -1,53 +1,1344 @@
 #include "msm3d/msm_calibration.hpp"
+
 #include "msm3d/camera_calibration.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace msm3d {
+namespace {
 
-double RationalAngleModel::evaluate(double psi) const {
-  if (!valid) return 0.0;
-  const double num = psi - psi_ref;
-  const double den = a1 * psi + a2;
-  if (std::abs(den) < 1e-9) return 0.0;
-  return std::atan(num / den);
+constexpr double kEpsilon = 1e-12;
+
+struct LocalPhaseFit {
+  bool valid = false;
+  double x = 0.0;
+  double slope = 0.0;
+  double rmse = std::numeric_limits<double>::infinity();
+};
+
+using PosePointGroups = std::vector<std::vector<cv::Vec3d>>;
+using PlaneObservationSets = std::vector<PosePointGroups>;
+
+struct ReconstructionDiagnostics {
+  double rmse_3d_mm = 0.0;
+  double model_plane_rmse_mm = 0.0;
+  double ray_plane_denom_min = 0.0;
+  double ray_plane_denom_p05 = 0.0;
+  double ray_plane_denom_median = 0.0;
+  double amplification = 0.0;
+  int sample_count = 0;
+
+  std::vector<double> phase_bin_rmse_3d_mm;
+  std::vector<double> phase_bin_plane_rmse_mm;
+  std::vector<int> phase_bin_sample_count;
+};
+
+std::vector<double> makeUniformSamples(double min_value, double max_value,
+                                       int count);
+
+double computePlaneConfidence(double rms_mm, double thickness_ratio,
+                              const MsmCalibrationOptions& options) {
+  if (!std::isfinite(rms_mm) || rms_mm < 0.0 ||
+      !std::isfinite(thickness_ratio) || thickness_ratio < 0.0) {
+    return 0.0;
+  }
+
+  const double rms_floor =
+      std::max(options.plane_confidence_rms_floor_mm, 1e-6);
+  const double rms_weight = 1.0 / (rms_mm * rms_mm + rms_floor * rms_floor);
+
+  const double thickness_scale = std::max(options.thickness_soft_scale, 1e-6);
+  const double normalized_thickness = thickness_ratio / thickness_scale;
+
+  // A gentle soft penalty. The broad max_thickness_ratio is still retained as
+  // a sanity limit for clearly non-planar observations.
+  const double thickness_weight =
+      1.0 / std::sqrt(1.0 + normalized_thickness * normalized_thickness);
+
+  return rms_weight * thickness_weight;
 }
 
-// 统一解析：常数项位于 beta_u[0] / beta_v[0]，后续为 cos/sin 谐波项
+double weightedMedian(const std::vector<double>& values,
+                      const std::vector<double>& weights) {
+  if (values.empty() || values.size() != weights.size()) {
+    return 0.0;
+  }
+
+  std::vector<std::pair<double, double>> pairs;
+  pairs.reserve(values.size());
+
+  double total_weight = 0.0;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (!std::isfinite(values[i]) || !std::isfinite(weights[i]) ||
+        weights[i] <= 0.0) {
+      continue;
+    }
+    pairs.emplace_back(values[i], weights[i]);
+    total_weight += weights[i];
+  }
+
+  if (pairs.empty() || total_weight <= 0.0) {
+    return 0.0;
+  }
+
+  std::sort(pairs.begin(), pairs.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.first < rhs.first;
+  });
+
+  const double half_weight = 0.5 * total_weight;
+  double accumulated = 0.0;
+  for (const auto& item : pairs) {
+    accumulated += item.second;
+    if (accumulated >= half_weight) {
+      return item.first;
+    }
+  }
+
+  return pairs.back().first;
+}
+
+LocalPhaseFit fitLocalPhaseLine(const cv::Mat& phase_f64, int y, int crossing_x,
+                                double target_psi, const cv::Mat& mask,
+                                int half_window, double min_abs_gradient,
+                                double max_abs_gradient) {
+  LocalPhaseFit result;
+
+  const int cols = phase_f64.cols;
+  const bool has_mask = !mask.empty() && mask.size() == phase_f64.size();
+
+  // Include both crossing endpoints and a symmetric neighborhood.
+  const int x_begin = std::max(0, crossing_x - half_window);
+  const int x_end = std::min(cols - 1, crossing_x + 1 + half_window);
+
+  const double* row_ptr = phase_f64.ptr<double>(y);
+  const uchar* mask_ptr = has_mask ? mask.ptr<uchar>(y) : nullptr;
+
+  double sum_x = 0.0;
+  double sum_p = 0.0;
+  int count = 0;
+
+  for (int x = x_begin; x <= x_end; ++x) {
+    if (has_mask && !mask_ptr[x]) {
+      continue;
+    }
+
+    const double p = row_ptr[x];
+    if (!std::isfinite(p)) {
+      continue;
+    }
+
+    sum_x += static_cast<double>(x);
+    sum_p += p;
+    ++count;
+  }
+
+  if (count < 3) {
+    return result;
+  }
+
+  const double mean_x = sum_x / static_cast<double>(count);
+  const double mean_p = sum_p / static_cast<double>(count);
+
+  double sxx = 0.0;
+  double sxp = 0.0;
+
+  for (int x = x_begin; x <= x_end; ++x) {
+    if (has_mask && !mask_ptr[x]) {
+      continue;
+    }
+
+    const double p = row_ptr[x];
+    if (!std::isfinite(p)) {
+      continue;
+    }
+
+    const double dx = static_cast<double>(x) - mean_x;
+    const double dp = p - mean_p;
+    sxx += dx * dx;
+    sxp += dx * dp;
+  }
+
+  if (sxx <= kEpsilon) {
+    return result;
+  }
+
+  const double slope = sxp / sxx;
+  const double abs_slope = std::abs(slope);
+  if (!std::isfinite(slope) || abs_slope < min_abs_gradient ||
+      abs_slope > max_abs_gradient) {
+    return result;
+  }
+
+  const double intercept = mean_p - slope * mean_x;
+  const double fitted_x = (target_psi - intercept) / slope;
+
+  // The fitted crossing must remain near the local support interval.
+  if (!std::isfinite(fitted_x) ||
+      fitted_x < static_cast<double>(x_begin) - 0.5 ||
+      fitted_x > static_cast<double>(x_end) + 0.5) {
+    return result;
+  }
+
+  double sum_sq = 0.0;
+  int residual_count = 0;
+  for (int x = x_begin; x <= x_end; ++x) {
+    if (has_mask && !mask_ptr[x]) {
+      continue;
+    }
+
+    const double p = row_ptr[x];
+    if (!std::isfinite(p)) {
+      continue;
+    }
+
+    const double predicted = slope * static_cast<double>(x) + intercept;
+    const double residual = p - predicted;
+    sum_sq += residual * residual;
+    ++residual_count;
+  }
+
+  if (residual_count < 3) {
+    return result;
+  }
+
+  result.valid = true;
+  result.x = fitted_x;
+  result.slope = slope;
+  result.rmse = std::sqrt(sum_sq / static_cast<double>(residual_count));
+  return result;
+}
+
+bool computeWeightedPlaneSvd(const std::vector<cv::Vec3d>& points,
+                             const std::vector<double>& weights,
+                             cv::Vec3d& out_center, cv::Vec3d& out_normal,
+                             cv::Vec3d& out_singular_values) {
+  if (points.size() < 3 || points.size() != weights.size()) {
+    return false;
+  }
+
+  double sum_weights = 0.0;
+  cv::Vec3d center(0.0, 0.0, 0.0);
+
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    const double w = weights[i];
+    if (!std::isfinite(w) || w <= 0.0) {
+      continue;
+    }
+    center += points[i] * w;
+    sum_weights += w;
+  }
+
+  if (sum_weights <= kEpsilon) {
+    return false;
+  }
+
+  center /= sum_weights;
+
+  cv::Mat A(static_cast<int>(points.size()), 3, CV_64F, cv::Scalar(0.0));
+
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    const double w = std::max(weights[i], 0.0);
+    const double sqrt_w = std::sqrt(w);
+    const cv::Vec3d q = points[i] - center;
+
+    A.at<double>(static_cast<int>(i), 0) = sqrt_w * q[0];
+    A.at<double>(static_cast<int>(i), 1) = sqrt_w * q[1];
+    A.at<double>(static_cast<int>(i), 2) = sqrt_w * q[2];
+  }
+
+  cv::Mat singular_values;
+  cv::Mat u;
+  cv::Mat vt;
+  cv::SVD::compute(A, singular_values, u, vt);
+
+  if (singular_values.total() < 3 || vt.rows < 3 || vt.cols < 3) {
+    return false;
+  }
+
+  out_center = center;
+  out_normal =
+      cv::Vec3d(vt.at<double>(2, 0), vt.at<double>(2, 1), vt.at<double>(2, 2));
+  out_normal = cv::normalize(out_normal);
+
+  out_singular_values =
+      cv::Vec3d(singular_values.at<double>(0), singular_values.at<double>(1),
+                singular_values.at<double>(2));
+  return true;
+}
+
+void normalizePlaneConfidences(std::vector<DiscretePlane>& planes) {
+  std::vector<double> confidences;
+  confidences.reserve(planes.size());
+
+  for (const auto& plane : planes) {
+    if (plane.valid && std::isfinite(plane.confidence) &&
+        plane.confidence > 0.0) {
+      confidences.push_back(plane.confidence);
+    }
+  }
+
+  if (confidences.empty()) {
+    return;
+  }
+
+  const std::size_t mid = confidences.size() / 2;
+  std::nth_element(confidences.begin(),
+                   confidences.begin() + static_cast<std::ptrdiff_t>(mid),
+                   confidences.end());
+  const double median_conf = std::max(confidences[mid], kEpsilon);
+
+  for (auto& plane : planes) {
+    if (!plane.valid) {
+      plane.confidence = 0.0;
+      plane.weight = 0.0;
+      continue;
+    }
+
+    const double normalized =
+        std::clamp(plane.confidence / median_conf, 0.1, 10.0);
+    plane.confidence = normalized;
+    plane.weight = normalized;
+  }
+}
+
+void printPlaneQualityDiagnostics(const std::vector<DiscretePlane>& planes,
+                                  const MsmCalibrationOptions& options) {
+  int valid_count = 0;
+  int rejected_pose_count = 0;
+  int rejected_spread = 0;
+  int rejected_thickness = 0;
+  int rejected_rms = 0;
+
+  std::vector<double> valid_rms;
+  std::vector<double> valid_spread;
+  std::vector<double> valid_thickness;
+  std::vector<double> valid_confidence;
+
+  for (const auto& plane : planes) {
+    if (plane.pose_count < options.min_covisible_poses) {
+      ++rejected_pose_count;
+    }
+    if (plane.spread_ratio < options.min_spread_ratio) {
+      ++rejected_spread;
+    }
+    if (plane.thickness_ratio > options.max_thickness_ratio) {
+      ++rejected_thickness;
+    }
+    if (plane.rms_mm > options.max_plane_rms_mm) {
+      ++rejected_rms;
+    }
+
+    if (!plane.valid) {
+      continue;
+    }
+
+    ++valid_count;
+    valid_rms.push_back(plane.rms_mm);
+    valid_spread.push_back(plane.spread_ratio);
+    valid_thickness.push_back(plane.thickness_ratio);
+    valid_confidence.push_back(plane.confidence);
+  }
+
+  auto print_stats = [](const char* name, std::vector<double> values) {
+    if (values.empty()) {
+      std::cout << "  " << name << ": n/a" << std::endl;
+      return;
+    }
+
+    std::sort(values.begin(), values.end());
+    const double min_v = values.front();
+    const double med_v = values[values.size() / 2];
+    const double max_v = values.back();
+
+    std::cout << "  " << name << ": min=" << min_v << ", median=" << med_v
+              << ", max=" << max_v << std::endl;
+  };
+
+  std::cout << "\nPlane quality diagnostics" << std::endl;
+  std::cout << "  valid planes: " << valid_count << " / " << planes.size()
+            << std::endl;
+  print_stats("RMS [mm]", valid_rms);
+  print_stats("spread ratio sigma2/sigma1", valid_spread);
+  print_stats("thickness ratio sigma3/sigma2", valid_thickness);
+  print_stats("normalized confidence", valid_confidence);
+
+  std::cout << "  rejection counters (a plane may hit multiple rules):"
+            << std::endl;
+  std::cout << "    insufficient poses: " << rejected_pose_count << std::endl;
+  std::cout << "    insufficient spread: " << rejected_spread << std::endl;
+  std::cout << "    excessive thickness: " << rejected_thickness << std::endl;
+  std::cout << "    excessive RMS: " << rejected_rms << std::endl;
+}
+
+cv::Vec3d rotateAroundAxis(const cv::Vec3d& vector, const cv::Vec3d& axis,
+                           double angle_rad) {
+  cv::Mat rotation;
+  cv::Rodrigues(axis * angle_rad, rotation);
+
+  const cv::Mat input =
+      (cv::Mat_<double>(3, 1) << vector[0], vector[1], vector[2]);
+  const cv::Mat output = rotation * input;
+
+  return cv::Vec3d(output.at<double>(0), output.at<double>(1),
+                   output.at<double>(2));
+}
+
+double evaluatePiecewiseLinearCorrection(const RationalAngleModel& model,
+                                         double psi) {
+  const std::size_t count = model.correction_psi.size();
+
+  if (count < 2 || model.correction_alpha.size() != count) {
+    return 0.0;
+  }
+
+  if (psi <= model.correction_psi.front()) {
+    return model.correction_alpha.front();
+  }
+
+  if (psi >= model.correction_psi.back()) {
+    return model.correction_alpha.back();
+  }
+
+  const auto upper = std::upper_bound(model.correction_psi.begin(),
+                                      model.correction_psi.end(), psi);
+
+  const std::size_t right = static_cast<std::size_t>(
+      std::distance(model.correction_psi.begin(), upper));
+  const std::size_t left = right - 1;
+
+  const double x0 = model.correction_psi[left];
+  const double x1 = model.correction_psi[right];
+  const double t = (psi - x0) / (x1 - x0);
+
+  return (1.0 - t) * model.correction_alpha[left] +
+         t * model.correction_alpha[right];
+}
+
+bool angleModelIsStrictlyMonotonic(const RationalAngleModel& model,
+                                   double min_psi, double max_psi) {
+  if (!(max_psi > min_psi)) {
+    return false;
+  }
+
+  constexpr int kSamples = 4096;
+  double previous = model.evaluate(min_psi);
+
+  if (!std::isfinite(previous)) {
+    return false;
+  }
+
+  for (int i = 1; i <= kSamples; ++i) {
+    const double ratio = static_cast<double>(i) / static_cast<double>(kSamples);
+    const double psi = min_psi + ratio * (max_psi - min_psi);
+    const double current = model.evaluate(psi);
+
+    if (!std::isfinite(current) || current <= previous) {
+      return false;
+    }
+
+    previous = current;
+  }
+
+  return true;
+}
+
+double computeAngleModelRmse(const std::vector<DiscretePlane>& planes,
+                             const std::vector<double>& thetas,
+                             const RationalAngleModel& model,
+                             double* out_max_abs_error);
+
+double computeBaseAngleModelRmse(const std::vector<DiscretePlane>& planes,
+                                 const std::vector<double>& thetas,
+                                 const RationalAngleModel& model,
+                                 double* out_max_abs_error = nullptr) {
+  double weighted_sum_sq = 0.0;
+  double weight_sum = 0.0;
+  double max_abs_error = 0.0;
+
+  for (std::size_t i = 0; i < planes.size(); ++i) {
+    if (!planes[i].valid) {
+      continue;
+    }
+
+    const double residual = thetas[i] - model.evaluateBase(planes[i].psi);
+    const double weight = std::max(planes[i].confidence, 1e-8);
+
+    weighted_sum_sq += weight * residual * residual;
+    weight_sum += weight;
+    max_abs_error = std::max(max_abs_error, std::abs(residual));
+  }
+
+  if (out_max_abs_error != nullptr) {
+    *out_max_abs_error = max_abs_error;
+  }
+
+  return (weight_sum > 0.0) ? std::sqrt(weighted_sum_sq / weight_sum) : 0.0;
+}
+
+bool fitAngleResidualCorrection(RationalAngleModel& model,
+                                const std::vector<DiscretePlane>& planes,
+                                const std::vector<double>& thetas,
+                                const MsmCalibrationOptions& options,
+                                double* out_base_rmse = nullptr,
+                                double* out_corrected_rmse = nullptr) {
+  model.correction_psi.clear();
+  model.correction_alpha.clear();
+
+  double base_max_error = 0.0;
+  const double base_rmse =
+      computeBaseAngleModelRmse(planes, thetas, model, &base_max_error);
+
+  if (out_base_rmse != nullptr) {
+    *out_base_rmse = base_rmse;
+  }
+  if (out_corrected_rmse != nullptr) {
+    *out_corrected_rmse = base_rmse;
+  }
+
+  if (!options.angle_correction_enabled) {
+    return false;
+  }
+
+  std::vector<int> valid_indices;
+  valid_indices.reserve(planes.size());
+
+  for (std::size_t i = 0; i < planes.size(); ++i) {
+    if (planes[i].valid) {
+      valid_indices.push_back(static_cast<int>(i));
+    }
+  }
+
+  const int requested_knots = std::clamp(options.angle_correction_knots, 5, 21);
+  const int knot_count =
+      std::min(requested_knots, static_cast<int>(valid_indices.size()) - 2);
+
+  if (knot_count < 5) {
+    return false;
+  }
+
+  const double min_psi =
+      planes[static_cast<std::size_t>(valid_indices.front())].psi;
+  const double max_psi =
+      planes[static_cast<std::size_t>(valid_indices.back())].psi;
+
+  if (!(max_psi > min_psi) ||
+      !(model.psi_ref > min_psi && model.psi_ref < max_psi)) {
+    return false;
+  }
+
+  // Put psi_ref exactly on one knot. The correction at this knot is fixed to
+  // zero, so alpha(psi_ref)=0 is enforced by parameterization rather than by a
+  // post-fit constant shift.
+  const int ref_index = knot_count / 2;
+  const int left_count = ref_index;
+  const int right_count = knot_count - ref_index - 1;
+
+  model.correction_psi.resize(static_cast<std::size_t>(knot_count),
+                              model.psi_ref);
+
+  for (int i = 0; i <= left_count; ++i) {
+    const double t = (left_count > 0) ? static_cast<double>(i) /
+                                            static_cast<double>(left_count)
+                                      : 1.0;
+    model.correction_psi[static_cast<std::size_t>(i)] =
+        min_psi + t * (model.psi_ref - min_psi);
+  }
+
+  for (int i = 1; i <= right_count; ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(right_count);
+    model.correction_psi[static_cast<std::size_t>(ref_index + i)] =
+        model.psi_ref + t * (max_psi - model.psi_ref);
+  }
+
+  // Eliminate the reference-knot parameter from the unknown vector.
+  const int free_count = knot_count - 1;
+  std::vector<int> knot_to_column(static_cast<std::size_t>(knot_count), -1);
+
+  int next_column = 0;
+  for (int k = 0; k < knot_count; ++k) {
+    if (k == ref_index) {
+      continue;
+    }
+    knot_to_column[static_cast<std::size_t>(k)] = next_column++;
+  }
+
+  const int data_rows = static_cast<int>(valid_indices.size());
+  const int smooth_rows = std::max(0, knot_count - 2);
+
+  cv::Mat A = cv::Mat::zeros(data_rows + smooth_rows, free_count, CV_64F);
+  cv::Mat b = cv::Mat::zeros(data_rows + smooth_rows, 1, CV_64F);
+
+  for (int row = 0; row < data_rows; ++row) {
+    const int index = valid_indices[static_cast<std::size_t>(row)];
+    const auto& plane = planes[static_cast<std::size_t>(index)];
+    const double psi = plane.psi;
+    const double residual =
+        thetas[static_cast<std::size_t>(index)] - model.evaluateBase(psi);
+    const double sqrt_weight = std::sqrt(std::max(plane.confidence, 1e-8));
+
+    auto upper = std::upper_bound(model.correction_psi.begin(),
+                                  model.correction_psi.end(), psi);
+
+    int right =
+        static_cast<int>(std::distance(model.correction_psi.begin(), upper));
+    right = std::clamp(right, 1, knot_count - 1);
+    const int left = right - 1;
+
+    const double x0 = model.correction_psi[static_cast<std::size_t>(left)];
+    const double x1 = model.correction_psi[static_cast<std::size_t>(right)];
+    const double t = std::clamp((psi - x0) / (x1 - x0), 0.0, 1.0);
+
+    const int left_column = knot_to_column[static_cast<std::size_t>(left)];
+    const int right_column = knot_to_column[static_cast<std::size_t>(right)];
+
+    if (left_column >= 0) {
+      A.at<double>(row, left_column) += sqrt_weight * (1.0 - t);
+    }
+    if (right_column >= 0) {
+      A.at<double>(row, right_column) += sqrt_weight * t;
+    }
+
+    b.at<double>(row, 0) = sqrt_weight * residual;
+  }
+
+  // Second-difference smoothness on knot values. Nonuniform knot spacing
+  // around psi_ref is mild here; this term is intentionally only a soft
+  // regularizer, not a physical model.
+  const double sqrt_smoothness =
+      std::sqrt(std::max(options.angle_correction_smoothness, 0.0));
+
+  for (int k = 1; k + 1 < knot_count; ++k) {
+    const int row = data_rows + (k - 1);
+    const int km1_col = knot_to_column[static_cast<std::size_t>(k - 1)];
+    const int k_col = knot_to_column[static_cast<std::size_t>(k)];
+    const int kp1_col = knot_to_column[static_cast<std::size_t>(k + 1)];
+
+    if (km1_col >= 0) {
+      A.at<double>(row, km1_col) += sqrt_smoothness;
+    }
+    if (k_col >= 0) {
+      A.at<double>(row, k_col) += -2.0 * sqrt_smoothness;
+    }
+    if (kp1_col >= 0) {
+      A.at<double>(row, kp1_col) += sqrt_smoothness;
+    }
+  }
+
+  cv::Mat free_parameters;
+  if (!cv::solve(A, b, free_parameters, cv::DECOMP_SVD)) {
+    model.correction_psi.clear();
+    return false;
+  }
+
+  model.correction_alpha.assign(static_cast<std::size_t>(knot_count), 0.0);
+
+  for (int k = 0; k < knot_count; ++k) {
+    const int column = knot_to_column[static_cast<std::size_t>(k)];
+
+    if (column >= 0) {
+      model.correction_alpha[static_cast<std::size_t>(k)] =
+          free_parameters.at<double>(column);
+    }
+  }
+
+  const double max_allowed = options.angle_correction_max_abs_mrad * 1e-3;
+
+  double max_abs = 0.0;
+  for (const double value : model.correction_alpha) {
+    max_abs = std::max(max_abs, std::abs(value));
+  }
+
+  if (max_abs > max_allowed && max_abs > 0.0) {
+    const double scale = max_allowed / max_abs;
+    for (double& value : model.correction_alpha) {
+      value *= scale;
+    }
+  }
+
+  // Preserve strict monotonicity of the complete mapping. If needed, shrink
+  // only the correction; the rational trend remains untouched.
+  if (!angleModelIsStrictlyMonotonic(model, min_psi, max_psi)) {
+    const std::vector<double> original = model.correction_alpha;
+    double low = 0.0;
+    double high = 1.0;
+
+    for (int iteration = 0; iteration < 50; ++iteration) {
+      const double scale = 0.5 * (low + high);
+
+      for (std::size_t i = 0; i < original.size(); ++i) {
+        model.correction_alpha[i] = scale * original[i];
+      }
+
+      if (angleModelIsStrictlyMonotonic(model, min_psi, max_psi)) {
+        low = scale;
+      } else {
+        high = scale;
+      }
+    }
+
+    for (std::size_t i = 0; i < original.size(); ++i) {
+      model.correction_alpha[i] = low * original[i];
+    }
+  }
+
+  double corrected_max_error = 0.0;
+  const double corrected_rmse =
+      computeAngleModelRmse(planes, thetas, model, &corrected_max_error);
+
+  if (out_corrected_rmse != nullptr) {
+    *out_corrected_rmse = corrected_rmse;
+  }
+
+  // A correction that does not improve the actual runtime model is rejected.
+  if (!(corrected_rmse + 1e-12 < base_rmse)) {
+    model.correction_psi.clear();
+    model.correction_alpha.clear();
+
+    if (out_corrected_rmse != nullptr) {
+      *out_corrected_rmse = base_rmse;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+double invertAngleModel(const RationalAngleModel& model, double target_theta,
+                        double min_psi, double max_psi) {
+  if (!model.valid || !(max_psi > min_psi)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  double lo = min_psi;
+  double hi = max_psi;
+  const double theta_lo = model.evaluate(lo);
+  const double theta_hi = model.evaluate(hi);
+  const bool increasing = theta_hi >= theta_lo;
+
+  const double theta_min = std::min(theta_lo, theta_hi);
+  const double theta_max = std::max(theta_lo, theta_hi);
+  if (target_theta < theta_min - 1e-10 || target_theta > theta_max + 1e-10) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  for (int iter = 0; iter < 80; ++iter) {
+    const double mid = 0.5 * (lo + hi);
+    const double theta_mid = model.evaluate(mid);
+
+    if (increasing) {
+      if (theta_mid < target_theta) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    } else {
+      if (theta_mid > target_theta) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+  }
+
+  return 0.5 * (lo + hi);
+}
+
+std::vector<double> makeUniformSamples(double min_value, double max_value,
+                                       int count) {
+  std::vector<double> samples;
+  if (count <= 0) {
+    return samples;
+  }
+
+  samples.reserve(static_cast<std::size_t>(count));
+  if (count == 1) {
+    samples.push_back(0.5 * (min_value + max_value));
+    return samples;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(count - 1);
+    samples.push_back(min_value + t * (max_value - min_value));
+  }
+
+  return samples;
+}
+
+double computeAngleModelRmse(const std::vector<DiscretePlane>& planes,
+                             const std::vector<double>& thetas,
+                             const RationalAngleModel& model,
+                             double* out_max_abs_error = nullptr) {
+  double weighted_sum_sq = 0.0;
+  double weight_sum = 0.0;
+  double max_abs_error = 0.0;
+
+  for (std::size_t i = 0; i < planes.size(); ++i) {
+    if (!planes[i].valid) {
+      continue;
+    }
+
+    const double prediction = model.evaluate(planes[i].psi);
+    const double residual = thetas[i] - prediction;
+    const double weight = std::max(planes[i].confidence, 1e-6);
+
+    weighted_sum_sq += weight * residual * residual;
+    weight_sum += weight;
+    max_abs_error = std::max(max_abs_error, std::abs(residual));
+  }
+
+  if (out_max_abs_error != nullptr) {
+    *out_max_abs_error = max_abs_error;
+  }
+
+  return (weight_sum > 0.0) ? std::sqrt(weighted_sum_sq / weight_sum) : 0.0;
+}
+
+DiscretePlane fitOffsetForFixedNormal(const PosePointGroups& points_by_pose,
+                                      double psi, const cv::Vec3d& fixed_normal,
+                                      const DiscretePlane& geometry_source,
+                                      const MsmCalibrationOptions& options) {
+  DiscretePlane plane = geometry_source;
+  plane.psi = psi;
+  plane.normal = cv::normalize(fixed_normal);
+  plane.valid = false;
+
+  std::vector<cv::Vec3d> points;
+  std::vector<double> base_weights;
+  std::vector<double> projected_offsets;
+
+  int contributing_poses = 0;
+  std::size_t total_points = 0;
+  for (const auto& pose_points : points_by_pose) {
+    if (!pose_points.empty()) {
+      ++contributing_poses;
+      total_points += pose_points.size();
+    }
+  }
+
+  plane.pose_count = contributing_poses;
+  plane.point_count = static_cast<int>(total_points);
+
+  if (contributing_poses <= 0 || total_points < 30) {
+    plane.confidence = 0.0;
+    plane.weight = 0.0;
+    return plane;
+  }
+
+  points.reserve(total_points);
+  base_weights.reserve(total_points);
+  projected_offsets.reserve(total_points);
+
+  for (const auto& pose_points : points_by_pose) {
+    if (pose_points.empty()) {
+      continue;
+    }
+
+    const double point_weight = 1.0 / static_cast<double>(pose_points.size());
+
+    for (const auto& point : pose_points) {
+      points.push_back(point);
+      base_weights.push_back(point_weight);
+      projected_offsets.push_back(-plane.normal.dot(point));
+    }
+  }
+
+  double d = weightedMedian(projected_offsets, base_weights);
+
+  constexpr int kMaxIterations = 8;
+  constexpr double kHuber = 1.345;
+  std::vector<double> combined_weights(base_weights.size(), 0.0);
+
+  for (int iter = 0; iter < kMaxIterations; ++iter) {
+    std::vector<double> abs_residuals(points.size(), 0.0);
+
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      abs_residuals[i] = std::abs(plane.normal.dot(points[i]) + d);
+    }
+
+    const double mad = weightedMedian(abs_residuals, base_weights);
+    const double sigma = std::max(1.4826 * mad, 0.02);
+
+    double weighted_sum = 0.0;
+    double weight_sum = 0.0;
+
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      const double normalized = abs_residuals[i] / sigma;
+      const double robust_weight =
+          (normalized > kHuber) ? (kHuber / normalized) : 1.0;
+
+      combined_weights[i] = base_weights[i] * robust_weight;
+      weighted_sum += combined_weights[i] * projected_offsets[i];
+      weight_sum += combined_weights[i];
+    }
+
+    if (weight_sum <= kEpsilon) {
+      break;
+    }
+
+    const double next_d = weighted_sum / weight_sum;
+    if (std::abs(next_d - d) < 1e-10) {
+      d = next_d;
+      break;
+    }
+    d = next_d;
+  }
+
+  plane.d = d;
+
+  double weighted_sum_sq = 0.0;
+  double weighted_inlier_mass = 0.0;
+  double total_base_mass = 0.0;
+  int inlier_count = 0;
+
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    const double residual = plane.normal.dot(points[i]) + plane.d;
+    const double base_weight = base_weights[i];
+    total_base_mass += base_weight;
+
+    if (std::abs(residual) <= options.plane_inlier_threshold_mm) {
+      weighted_sum_sq += base_weight * residual * residual;
+      weighted_inlier_mass += base_weight;
+      ++inlier_count;
+    }
+  }
+
+  plane.inlier_count = inlier_count;
+  plane.inlier_ratio = (total_base_mass > kEpsilon)
+                           ? (weighted_inlier_mass / total_base_mass)
+                           : 0.0;
+
+  plane.rms_mm = (weighted_inlier_mass > kEpsilon)
+                     ? std::sqrt(weighted_sum_sq / weighted_inlier_mass)
+                     : std::numeric_limits<double>::infinity();
+
+  const bool pose_ok = plane.pose_count >= options.min_covisible_poses;
+  const bool geometry_ok =
+      geometry_source.valid &&
+      geometry_source.spread_ratio >= options.min_spread_ratio &&
+      geometry_source.thickness_ratio <= options.max_thickness_ratio;
+  const bool rms_ok =
+      std::isfinite(plane.rms_mm) && plane.rms_mm <= options.max_plane_rms_mm;
+
+  plane.valid = pose_ok && geometry_ok && rms_ok && plane.inlier_count >= 30;
+
+  if (plane.valid) {
+    plane.confidence =
+        computePlaneConfidence(plane.rms_mm, plane.thickness_ratio, options);
+    plane.weight = plane.confidence;
+  } else {
+    plane.confidence = 0.0;
+    plane.weight = 0.0;
+  }
+
+  return plane;
+}
+
+bool solveCenterFromPlanes(const std::vector<DiscretePlane>& planes,
+                           const cv::Vec3d& u, const cv::Vec3d& v,
+                           cv::Vec3d& out_center) {
+  std::vector<const DiscretePlane*> valid_planes;
+  for (const auto& plane : planes) {
+    if (plane.valid) {
+      valid_planes.push_back(&plane);
+    }
+  }
+
+  if (valid_planes.size() < 3) {
+    return false;
+  }
+
+  cv::Mat A(static_cast<int>(valid_planes.size()), 2, CV_64F);
+  cv::Mat b(static_cast<int>(valid_planes.size()), 1, CV_64F);
+
+  for (std::size_t i = 0; i < valid_planes.size(); ++i) {
+    const auto& plane = *valid_planes[i];
+    const double sqrt_weight = std::sqrt(std::max(plane.confidence, 1e-8));
+
+    A.at<double>(static_cast<int>(i), 0) = sqrt_weight * plane.normal.dot(u);
+    A.at<double>(static_cast<int>(i), 1) = sqrt_weight * plane.normal.dot(v);
+    b.at<double>(static_cast<int>(i), 0) = -sqrt_weight * plane.d;
+  }
+
+  cv::Mat parameters;
+  if (!cv::solve(A, b, parameters, cv::DECOMP_SVD)) {
+    return false;
+  }
+
+  out_center = parameters.at<double>(0) * u + parameters.at<double>(1) * v;
+  return true;
+}
+
+void printPosePlaneResidualDiagnostics(const char* title,
+                                       const std::vector<DiscretePlane>& planes,
+                                       const PlaneObservationSets& observations,
+                                       const std::vector<int>& pose_ids) {
+  if (planes.size() != observations.size() || pose_ids.empty()) {
+    return;
+  }
+
+  std::vector<double> sum_plane_rms_sq(pose_ids.size(), 0.0);
+  std::vector<double> sum_plane_bias(pose_ids.size(), 0.0);
+  std::vector<int> valid_plane_counts(pose_ids.size(), 0);
+
+  for (std::size_t p = 0; p < planes.size(); ++p) {
+    if (!planes[p].valid) {
+      continue;
+    }
+
+    const auto& groups = observations[p];
+    for (std::size_t pose_idx = 0;
+         pose_idx < pose_ids.size() && pose_idx < groups.size(); ++pose_idx) {
+      const auto& points = groups[pose_idx];
+      if (points.empty()) {
+        continue;
+      }
+
+      double sum_sq = 0.0;
+      double sum_signed = 0.0;
+
+      for (const auto& point : points) {
+        const double residual = planes[p].normal.dot(point) + planes[p].d;
+        sum_sq += residual * residual;
+        sum_signed += residual;
+      }
+
+      const double count = static_cast<double>(points.size());
+      const double group_rms = std::sqrt(sum_sq / count);
+      const double group_bias = sum_signed / count;
+
+      sum_plane_rms_sq[pose_idx] += group_rms * group_rms;
+      sum_plane_bias[pose_idx] += group_bias;
+      ++valid_plane_counts[pose_idx];
+    }
+  }
+
+  std::cout << "\n" << title << std::endl;
+  for (std::size_t i = 0; i < pose_ids.size(); ++i) {
+    if (valid_plane_counts[i] <= 0) {
+      std::cout << "  pose " << std::setw(2) << pose_ids[i] << ": n/a"
+                << std::endl;
+      continue;
+    }
+
+    const double plane_count = static_cast<double>(valid_plane_counts[i]);
+    const double rms = std::sqrt(sum_plane_rms_sq[i] / plane_count);
+    const double mean_bias = sum_plane_bias[i] / plane_count;
+
+    std::cout << "  pose " << std::setw(2) << pose_ids[i]
+              << ": plane RMSE=" << std::fixed << std::setprecision(5) << rms
+              << " mm, mean signed bias=" << mean_bias
+              << " mm, planes=" << valid_plane_counts[i] << std::endl;
+  }
+}
+
+ReconstructionDiagnostics evaluateReconstructionDetailed(
+    const MsmCalibrationResult& result, const cv::Mat& phase_map,
+    const cv::Mat& camera_matrix, const cv::Mat& dist_coeffs,
+    const BoardPlane& board_plane, double min_psi, double max_psi,
+    int pixel_stride, int phase_bin_count = 0) {
+  ReconstructionDiagnostics diagnostics;
+
+  if (phase_map.empty() || pixel_stride <= 0) {
+    return diagnostics;
+  }
+
+  cv::Mat phase64;
+  if (phase_map.channels() > 1) {
+    cv::extractChannel(phase_map, phase64, 0);
+  } else {
+    phase64 = phase_map;
+  }
+  phase64.convertTo(phase64, CV_64F);
+
+  std::vector<cv::Point2d> pixels;
+  std::vector<double> psis;
+
+  for (int y = 0; y < phase64.rows; y += pixel_stride) {
+    const double* row = phase64.ptr<double>(y);
+
+    for (int x = 0; x < phase64.cols; x += pixel_stride) {
+      const double psi = row[x];
+      if (std::isfinite(psi) && psi >= min_psi && psi <= max_psi) {
+        pixels.emplace_back(static_cast<double>(x), static_cast<double>(y));
+        psis.push_back(psi);
+      }
+    }
+  }
+
+  if (pixels.empty()) {
+    return diagnostics;
+  }
+
+  std::vector<cv::Point2d> normalized_points;
+  cv::undistortPoints(pixels, normalized_points, camera_matrix, dist_coeffs);
+
+  double sum_sq_3d = 0.0;
+  double sum_sq_plane = 0.0;
+  std::vector<double> denominators;
+  denominators.reserve(normalized_points.size());
+
+  const int bin_count = std::max(0, phase_bin_count);
+  std::vector<double> bin_sum_sq_3d(static_cast<std::size_t>(bin_count), 0.0);
+  std::vector<double> bin_sum_sq_plane(static_cast<std::size_t>(bin_count),
+                                       0.0);
+  std::vector<int> bin_samples(static_cast<std::size_t>(bin_count), 0);
+
+  for (std::size_t i = 0; i < normalized_points.size(); ++i) {
+    cv::Vec3d ray(normalized_points[i].x, normalized_points[i].y, 1.0);
+    ray = cv::normalize(ray);
+
+    const double board_denom = board_plane.normal.dot(ray);
+    if (std::abs(board_denom) < 1e-6) {
+      continue;
+    }
+
+    const double depth_gt = -board_plane.d / board_denom;
+    if (!std::isfinite(depth_gt) || depth_gt < 120.0 || depth_gt > 250.0) {
+      continue;
+    }
+
+    const cv::Vec3d X_gt = ray * depth_gt;
+
+    cv::Vec3d model_normal;
+    double model_d = 0.0;
+    result.evaluatePlane(psis[i], model_normal, model_d);
+
+    const double model_denom = model_normal.dot(ray);
+    const double abs_model_denom = std::abs(model_denom);
+    if (abs_model_denom < 1e-6) {
+      continue;
+    }
+
+    const double plane_residual = model_normal.dot(X_gt) + model_d;
+
+    // For a unit camera ray, the ray-wise 3D intersection error is exactly
+    // |plane_residual| / |n dot ray|.
+    const double error_3d = std::abs(plane_residual) / abs_model_denom;
+
+    if (!std::isfinite(error_3d)) {
+      continue;
+    }
+
+    sum_sq_3d += error_3d * error_3d;
+    sum_sq_plane += plane_residual * plane_residual;
+    denominators.push_back(abs_model_denom);
+
+    if (bin_count > 0 && max_psi > min_psi) {
+      const double normalized_phase = (psis[i] - min_psi) / (max_psi - min_psi);
+      int bin = static_cast<int>(
+          std::floor(normalized_phase * static_cast<double>(bin_count)));
+      bin = std::clamp(bin, 0, bin_count - 1);
+
+      bin_sum_sq_3d[static_cast<std::size_t>(bin)] += error_3d * error_3d;
+      bin_sum_sq_plane[static_cast<std::size_t>(bin)] +=
+          plane_residual * plane_residual;
+      ++bin_samples[static_cast<std::size_t>(bin)];
+    }
+  }
+
+  diagnostics.sample_count = static_cast<int>(denominators.size());
+
+  if (diagnostics.sample_count <= 0) {
+    return diagnostics;
+  }
+
+  const double count = static_cast<double>(diagnostics.sample_count);
+
+  diagnostics.rmse_3d_mm = std::sqrt(sum_sq_3d / count);
+  diagnostics.model_plane_rmse_mm = std::sqrt(sum_sq_plane / count);
+
+  std::sort(denominators.begin(), denominators.end());
+  diagnostics.ray_plane_denom_min = denominators.front();
+
+  const std::size_t p05_index =
+      std::min(denominators.size() - 1,
+               static_cast<std::size_t>(
+                   0.05 * static_cast<double>(denominators.size() - 1)));
+
+  diagnostics.ray_plane_denom_p05 = denominators[p05_index];
+  diagnostics.ray_plane_denom_median = denominators[denominators.size() / 2];
+
+  if (diagnostics.model_plane_rmse_mm > 1e-12) {
+    diagnostics.amplification =
+        diagnostics.rmse_3d_mm / diagnostics.model_plane_rmse_mm;
+  }
+
+  diagnostics.phase_bin_rmse_3d_mm.assign(static_cast<std::size_t>(bin_count),
+                                          0.0);
+  diagnostics.phase_bin_plane_rmse_mm.assign(
+      static_cast<std::size_t>(bin_count), 0.0);
+  diagnostics.phase_bin_sample_count = bin_samples;
+
+  for (int bin = 0; bin < bin_count; ++bin) {
+    const int samples = bin_samples[static_cast<std::size_t>(bin)];
+    if (samples <= 0) {
+      continue;
+    }
+
+    diagnostics.phase_bin_rmse_3d_mm[static_cast<std::size_t>(bin)] =
+        std::sqrt(bin_sum_sq_3d[static_cast<std::size_t>(bin)] /
+                  static_cast<double>(samples));
+    diagnostics.phase_bin_plane_rmse_mm[static_cast<std::size_t>(bin)] =
+        std::sqrt(bin_sum_sq_plane[static_cast<std::size_t>(bin)] /
+                  static_cast<double>(samples));
+  }
+
+  return diagnostics;
+}
+
+void printPhaseBinDiagnostics(const ReconstructionDiagnostics& diagnostics,
+                              double min_psi, double max_psi) {
+  const std::size_t bin_count = diagnostics.phase_bin_sample_count.size();
+  if (bin_count == 0 || !(max_psi > min_psi)) {
+    return;
+  }
+
+  std::cout << "    phase-bin RMSE [psi range: 3D / plane, samples]"
+            << std::endl;
+
+  for (std::size_t bin = 0; bin < bin_count; ++bin) {
+    const double left = min_psi + (max_psi - min_psi) *
+                                      static_cast<double>(bin) /
+                                      static_cast<double>(bin_count);
+    const double right = min_psi + (max_psi - min_psi) *
+                                       static_cast<double>(bin + 1) /
+                                       static_cast<double>(bin_count);
+
+    std::cout << "      [" << std::fixed << std::setprecision(1) << left << ", "
+              << right << "]: ";
+
+    if (diagnostics.phase_bin_sample_count[bin] <= 0) {
+      std::cout << "n/a" << std::endl;
+      continue;
+    }
+
+    std::cout << std::setprecision(5) << diagnostics.phase_bin_rmse_3d_mm[bin]
+              << " / " << diagnostics.phase_bin_plane_rmse_mm[bin] << " mm, "
+              << diagnostics.phase_bin_sample_count[bin] << std::endl;
+  }
+}
+
+double computeHarmonicPlaneOffsetRmse(
+    const MsmCalibrationResult& result,
+    const std::vector<DiscretePlane>& reference_planes,
+    double* out_max_abs_mm = nullptr) {
+  double weighted_sum_sq = 0.0;
+  double weight_sum = 0.0;
+  double max_abs_mm = 0.0;
+
+  for (const auto& plane : reference_planes) {
+    if (!plane.valid) {
+      continue;
+    }
+
+    cv::Vec3d model_normal;
+    double model_d = 0.0;
+    result.evaluatePlane(plane.psi, model_normal, model_d);
+
+    if (model_normal.dot(plane.normal) < 0.0) {
+      model_normal = -model_normal;
+      model_d = -model_d;
+    }
+
+    // reference_planes already use the continuous normal model, so d
+    // difference is the orthogonal plane offset error.
+    const double residual = model_d - plane.d;
+    const double weight = std::max(plane.confidence, 1e-8);
+
+    weighted_sum_sq += weight * residual * residual;
+    weight_sum += weight;
+    max_abs_mm = std::max(max_abs_mm, std::abs(residual));
+  }
+
+  if (out_max_abs_mm != nullptr) {
+    *out_max_abs_mm = max_abs_mm;
+  }
+
+  return (weight_sum > 0.0) ? std::sqrt(weighted_sum_sq / weight_sum) : 0.0;
+}
+
+void printNormalAxisDiagnostics(const std::vector<DiscretePlane>& planes,
+                                const cv::Vec3d& axis) {
+  double weighted_sum_sq = 0.0;
+  double weight_sum = 0.0;
+  double max_abs = 0.0;
+
+  for (const auto& plane : planes) {
+    if (!plane.valid) {
+      continue;
+    }
+
+    const double axial_component = plane.normal.dot(axis);
+    const double weight = std::max(plane.confidence, 1e-8);
+    weighted_sum_sq += weight * axial_component * axial_component;
+    weight_sum += weight;
+    max_abs = std::max(max_abs, std::abs(axial_component));
+  }
+
+  const double rms =
+      (weight_sum > 0.0) ? std::sqrt(weighted_sum_sq / weight_sum) : 0.0;
+
+  std::cout << "  observed normal axial-component RMS: " << rms
+            << ", max: " << max_abs << std::endl;
+}
+
+}  // namespace
+
+double RationalAngleModel::evaluateBase(double psi) const {
+  if (!valid) {
+    return 0.0;
+  }
+
+  const double delta_psi = psi - psi_ref;
+  const double denominator = b0 + b1 * delta_psi;
+
+  if (!std::isfinite(denominator) || std::abs(denominator) < 1e-12) {
+    return 0.0;
+  }
+
+  return std::atan2(delta_psi, denominator);
+}
+
+double RationalAngleModel::evaluateCorrection(double psi) const {
+  return evaluatePiecewiseLinearCorrection(*this, psi);
+}
+
+double RationalAngleModel::evaluate(double psi) const {
+  return evaluateBase(psi) + evaluateCorrection(psi);
+}
+
 void HarmonicDriftModel::evaluate(double theta_rad, double& out_delta_u,
                                   double& out_delta_v) const {
   out_delta_u = 0.0;
   out_delta_v = 0.0;
-  if (!valid || order <= 0 || beta_u.empty() || beta_v.empty()) return;
 
-  out_delta_u = beta_u[0];
-  out_delta_v = beta_v[0];
+  if (!valid || order <= 0) {
+    return;
+  }
 
   for (int k = 1; k <= order; ++k) {
-    const int idx_cos = 1 + 2 * (k - 1);
-    const int idx_sin = 1 + 2 * (k - 1) + 1;
+    const int idx = 2 * (k - 1);
     const double ang = static_cast<double>(k) * theta_rad;
-    const double c = std::cos(ang);
-    const double s = std::sin(ang);
+    const double cos_basis = std::cos(ang) - 1.0;
+    const double sin_basis = std::sin(ang);
 
-    if (idx_sin < static_cast<int>(beta_u.size())) {
-      out_delta_u += beta_u[idx_cos] * c + beta_u[idx_sin] * s;
+    if (idx + 1 < static_cast<int>(beta_u.size())) {
+      out_delta_u += beta_u[idx] * cos_basis + beta_u[idx + 1] * sin_basis;
     }
-    if (idx_sin < static_cast<int>(beta_v.size())) {
-      out_delta_v += beta_v[idx_cos] * c + beta_v[idx_sin] * s;
+    if (idx + 1 < static_cast<int>(beta_v.size())) {
+      out_delta_v += beta_v[idx] * cos_basis + beta_v[idx + 1] * sin_basis;
     }
   }
 }
@@ -56,7 +1347,6 @@ void MsmCalibrationResult::evaluatePlane(double psi, cv::Vec3d& out_normal,
                                          double& out_d) const {
   const double theta = angle_model.evaluate(psi);
 
-  // 1. 名义法向量沿转轴 w 旋转 theta
   cv::Mat R_theta;
   const cv::Vec3d rvec = nominal_axis_w * theta;
   cv::Rodrigues(rvec, R_theta);
@@ -68,8 +1358,8 @@ void MsmCalibrationResult::evaluatePlane(double psi, cv::Vec3d& out_normal,
   out_normal = cv::normalize(
       cv::Vec3d(n_mat.at<double>(0), n_mat.at<double>(1), n_mat.at<double>(2)));
 
-  // 2. 轴心漂移补偿 (包含常数项更新与动态摆动)
-  double delta_u = 0.0, delta_v = 0.0;
+  double delta_u = 0.0;
+  double delta_v = 0.0;
   if (harmonic_drift.valid && harmonic_drift.order > 0) {
     harmonic_drift.evaluate(theta, delta_u, delta_v);
   }
@@ -79,7 +1369,12 @@ void MsmCalibrationResult::evaluatePlane(double psi, cv::Vec3d& out_normal,
 }
 
 BoardPlane computeBoardPlane(const cv::Mat& rvec_or_R, const cv::Mat& t_mm) {
-  cv::Mat R_64, t_64;
+  if (rvec_or_R.empty() || t_mm.empty()) {
+    throw std::invalid_argument("Camera extrinsics must not be empty.");
+  }
+
+  cv::Mat R_64;
+  cv::Mat t_64;
   rvec_or_R.convertTo(R_64, CV_64F);
   t_mm.convertTo(t_64, CV_64F);
 
@@ -96,13 +1391,12 @@ BoardPlane computeBoardPlane(const cv::Mat& rvec_or_R, const cv::Mat& t_mm) {
     n = -n;
   }
 
-  const double* t_ptr = t_64.ptr<double>(0);
-  cv::Vec3d t(t_ptr[0], t_ptr[1], t_ptr[2]);
+  cv::Mat t_col = t_64.reshape(1, 3);
+  const cv::Vec3d t(t_col.at<double>(0), t_col.at<double>(1),
+                    t_col.at<double>(2));
 
-  if (cv::norm(t) > 1e-4 && cv::norm(t) < 5.0) {
-    t *= 1000.0;
-  }
-
+  // Project convention: all geometric lengths are millimetres.
+  // No automatic metre/mm guessing is allowed here.
   const double d = -n.dot(t);
   return {n, d};
 }
@@ -156,39 +1450,40 @@ std::pair<double, double> autoDetectValidPhaseRange(
 
   if (intervals.empty()) return {0.0, 0.0};
 
-  double global_min = 1e9, global_max = -1e9;
-  for (const auto& inv : intervals) {
-    global_min = std::min(global_min, inv.p_low);
-    global_max = std::max(global_max, inv.p_high);
+  double global_min = std::numeric_limits<double>::infinity();
+  double global_max = -std::numeric_limits<double>::infinity();
+  for (const auto& interval : intervals) {
+    global_min = std::min(global_min, interval.p_low);
+    global_max = std::max(global_max, interval.p_high);
   }
 
   const int required_poses = std::max(
       2, std::min(min_covisible_poses, static_cast<int>(intervals.size())));
-  const double step = 0.5;
-  double best_start = 0.0, best_end = 0.0;
+
+  constexpr double step = 0.5;
+  double best_start = 0.0;
+  double best_end = 0.0;
   double cur_start = -1.0;
   double max_len = 0.0;
 
   for (double psi = global_min; psi <= global_max; psi += step) {
     int covisible_count = 0;
-    for (const auto& inv : intervals) {
-      if (psi >= inv.p_low && psi <= inv.p_high) {
-        covisible_count++;
+    for (const auto& interval : intervals) {
+      if (psi >= interval.p_low && psi <= interval.p_high) {
+        ++covisible_count;
       }
     }
 
     if (covisible_count >= required_poses) {
       if (cur_start < 0.0) cur_start = psi;
-    } else {
-      if (cur_start >= 0.0) {
-        const double len = (psi - step) - cur_start;
-        if (len > max_len) {
-          max_len = len;
-          best_start = cur_start;
-          best_end = psi - step;
-        }
-        cur_start = -1.0;
+    } else if (cur_start >= 0.0) {
+      const double len = (psi - step) - cur_start;
+      if (len > max_len) {
+        max_len = len;
+        best_start = cur_start;
+        best_end = psi - step;
       }
+      cur_start = -1.0;
     }
   }
 
@@ -202,16 +1497,28 @@ std::pair<double, double> autoDetectValidPhaseRange(
 
   best_start += 2.0;
   best_end -= 2.0;
-  if (best_end <= best_start) return {global_min, global_max};
+  if (best_end <= best_start) {
+    return {global_min, global_max};
+  }
 
   return {best_start, best_end};
 }
 
-std::vector<cv::Point2d> extractIsoPhaseSubpixels(const cv::Mat& phase_map,
-                                                  double target_psi,
-                                                  const cv::Mat& mask,
-                                                  double grad_threshold) {
+std::vector<cv::Point2d> extractIsoPhaseSubpixels(
+    const cv::Mat& phase_map, double target_psi, const cv::Mat& mask,
+    double grad_threshold, int fit_half_window, double max_grad_threshold,
+    double max_lateral_jump_px) {
   if (phase_map.empty()) return {};
+
+  if (fit_half_window < 1) {
+    throw std::invalid_argument("fit_half_window must be at least 1.");
+  }
+
+  const double min_abs_gradient = std::max(grad_threshold, 1e-9);
+  if (!(max_grad_threshold > min_abs_gradient)) {
+    throw std::invalid_argument(
+        "max_grad_threshold must be greater than grad_threshold.");
+  }
 
   cv::Mat phase_f64;
   if (phase_map.channels() > 1) {
@@ -225,10 +1532,7 @@ std::vector<cv::Point2d> extractIsoPhaseSubpixels(const cv::Mat& phase_map,
 
   const int rows = phase_f64.rows;
   const int cols = phase_f64.cols;
-  const bool has_mask = (!mask.empty() && mask.size() == phase_f64.size());
-
-  const double min_phys_grad = std::max(grad_threshold, 0.01);
-  const double max_phys_grad = 0.5;
+  const bool has_mask = !mask.empty() && mask.size() == phase_f64.size();
 
   std::vector<cv::Point2d> raw_subpixels;
   raw_subpixels.reserve(rows);
@@ -237,56 +1541,71 @@ std::vector<cv::Point2d> extractIsoPhaseSubpixels(const cv::Mat& phase_map,
     const double* row_ptr = phase_f64.ptr<double>(y);
     const uchar* mask_ptr = has_mask ? mask.ptr<uchar>(y) : nullptr;
 
-    double best_x = -1.0;
-    double best_diff_metric = 1e9;
+    LocalPhaseFit best_fit;
 
     for (int x = 0; x < cols - 1; ++x) {
-      if (has_mask && (!mask_ptr[x] || !mask_ptr[x + 1])) continue;
+      if (has_mask && (!mask_ptr[x] || !mask_ptr[x + 1])) {
+        continue;
+      }
 
       const double p0 = row_ptr[x];
       const double p1 = row_ptr[x + 1];
+      if (!std::isfinite(p0) || !std::isfinite(p1)) {
+        continue;
+      }
 
-      if (!std::isfinite(p0) || !std::isfinite(p1)) continue;
+      const bool crossing = (p0 <= target_psi && target_psi <= p1) ||
+                            (p1 <= target_psi && target_psi <= p0);
+      if (!crossing || std::abs(p1 - p0) < min_abs_gradient) {
+        continue;
+      }
 
-      if (p0 <= target_psi && target_psi < p1) {
-        const double diff = p1 - p0;
-        if (diff >= min_phys_grad && diff <= max_phys_grad) {
-          const double metric = std::abs(diff - 0.065);
-          if (metric < best_diff_metric) {
-            best_diff_metric = metric;
-            best_x = static_cast<double>(x) + (target_psi - p0) / diff;
-          }
-        }
+      const LocalPhaseFit candidate =
+          fitLocalPhaseLine(phase_f64, y, x, target_psi, mask, fit_half_window,
+                            min_abs_gradient, max_grad_threshold);
+
+      if (!candidate.valid) {
+        continue;
+      }
+
+      if (!best_fit.valid || candidate.rmse < best_fit.rmse) {
+        best_fit = candidate;
       }
     }
 
-    if (best_x >= 0.0) {
-      raw_subpixels.emplace_back(best_x, static_cast<double>(y));
+    if (best_fit.valid) {
+      raw_subpixels.emplace_back(best_fit.x, static_cast<double>(y));
     }
   }
 
-  if (raw_subpixels.size() < 10) return raw_subpixels;
+  if (raw_subpixels.size() < 10 || max_lateral_jump_px <= 0.0) {
+    return raw_subpixels;
+  }
 
+  // Suppress isolated row-wise x outliers while preserving the smooth
+  // iso-phase curve.
   std::vector<cv::Point2d> clean_subpixels;
   clean_subpixels.reserve(raw_subpixels.size());
 
-  const int window = 5;
-  const double max_lateral_jump = 5.0;
-
+  constexpr int kRowMedianHalfWindow = 5;
   for (std::size_t i = 0; i < raw_subpixels.size(); ++i) {
     std::vector<double> local_xs;
-    for (int w = -window; w <= window; ++w) {
+    local_xs.reserve(2 * kRowMedianHalfWindow + 1);
+
+    for (int w = -kRowMedianHalfWindow; w <= kRowMedianHalfWindow; ++w) {
       const int idx = static_cast<int>(i) + w;
       if (idx >= 0 && idx < static_cast<int>(raw_subpixels.size())) {
-        local_xs.push_back(raw_subpixels[idx].x);
+        local_xs.push_back(raw_subpixels[static_cast<std::size_t>(idx)].x);
       }
     }
 
-    std::nth_element(local_xs.begin(), local_xs.begin() + local_xs.size() / 2,
+    const std::size_t mid = local_xs.size() / 2;
+    std::nth_element(local_xs.begin(),
+                     local_xs.begin() + static_cast<std::ptrdiff_t>(mid),
                      local_xs.end());
-    const double median_x = local_xs[local_xs.size() / 2];
+    const double median_x = local_xs[mid];
 
-    if (std::abs(raw_subpixels[i].x - median_x) <= max_lateral_jump) {
+    if (std::abs(raw_subpixels[i].x - median_x) <= max_lateral_jump_px) {
       clean_subpixels.push_back(raw_subpixels[i]);
     }
   }
@@ -303,151 +1622,213 @@ std::vector<cv::Vec3d> projectSubpixelsToBoard(
   std::vector<cv::Point2d> norm_points;
   cv::undistortPoints(subpixels, norm_points, camera_matrix, dist_coeffs);
 
-  std::vector<cv::Vec3d> X_ref;
-  X_ref.reserve(subpixels.size());
+  std::vector<cv::Vec3d> points;
+  points.reserve(subpixels.size());
 
   for (const auto& pt : norm_points) {
     cv::Vec3d ray(pt.x, pt.y, 1.0);
     ray = cv::normalize(ray);
 
     const double denom = board_plane.normal.dot(ray);
-    if (std::abs(denom) < 1e-4) continue;
+    if (std::abs(denom) < 1e-4) {
+      continue;
+    }
 
     const double depth = -board_plane.d / denom;
-    if (depth < min_depth_mm || depth > max_depth_mm) continue;
+    if (!std::isfinite(depth) || depth < min_depth_mm || depth > max_depth_mm) {
+      continue;
+    }
 
-    X_ref.push_back(ray * depth);
+    points.push_back(ray * depth);
   }
 
-  return X_ref;
+  return points;
+}
+
+DiscretePlane fitPlaneRobustTLS(
+    const std::vector<std::vector<cv::Vec3d>>& points_by_pose, double psi,
+    const MsmCalibrationOptions& options) {
+  DiscretePlane plane;
+  plane.psi = psi;
+  plane.valid = false;
+
+  std::vector<cv::Vec3d> points;
+  std::vector<double> base_weights;
+
+  int contributing_poses = 0;
+  std::size_t total_points = 0;
+  for (const auto& pose_points : points_by_pose) {
+    if (!pose_points.empty()) {
+      ++contributing_poses;
+      total_points += pose_points.size();
+    }
+  }
+
+  plane.pose_count = contributing_poses;
+  plane.point_count = static_cast<int>(total_points);
+
+  if (contributing_poses <= 0 || total_points < 30) {
+    return plane;
+  }
+
+  points.reserve(total_points);
+  base_weights.reserve(total_points);
+
+  // Equal total weight per pose:
+  // sum_j w_ij = 1 for every contributing pose i.
+  for (const auto& pose_points : points_by_pose) {
+    if (pose_points.empty()) {
+      continue;
+    }
+
+    const double point_weight = 1.0 / static_cast<double>(pose_points.size());
+    for (const auto& point : pose_points) {
+      points.push_back(point);
+      base_weights.push_back(point_weight);
+    }
+  }
+
+  cv::Vec3d center;
+  cv::Vec3d normal;
+  cv::Vec3d singular_values;
+  if (!computeWeightedPlaneSvd(points, base_weights, center, normal,
+                               singular_values)) {
+    return plane;
+  }
+
+  double d = -normal.dot(center);
+
+  constexpr int kMaxIrlsIterations = 5;
+  constexpr double kHuber = 1.345;
+  std::vector<double> combined_weights = base_weights;
+
+  for (int iter = 0; iter < kMaxIrlsIterations; ++iter) {
+    std::vector<double> abs_residuals(points.size(), 0.0);
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      abs_residuals[i] = std::abs(normal.dot(points[i]) + d);
+    }
+
+    const double mad = weightedMedian(abs_residuals, base_weights);
+    const double sigma = std::max(1.4826 * mad, 0.05);
+
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      const double normalized_residual = abs_residuals[i] / sigma;
+      const double huber_weight =
+          (normalized_residual > kHuber) ? (kHuber / normalized_residual) : 1.0;
+
+      combined_weights[i] = base_weights[i] * huber_weight;
+    }
+
+    if (!computeWeightedPlaneSvd(points, combined_weights, center, normal,
+                                 singular_values)) {
+      return plane;
+    }
+
+    d = -normal.dot(center);
+  }
+
+  // Final robust weighted geometry diagnostics.
+  if (!computeWeightedPlaneSvd(points, combined_weights, center, normal,
+                               singular_values)) {
+    return plane;
+  }
+  d = -normal.dot(center);
+
+  const double s1 = singular_values[0];
+  const double s2 = singular_values[1];
+  const double s3 = singular_values[2];
+
+  plane.spread_ratio = s2 / (s1 + kEpsilon);
+  plane.thickness_ratio = s3 / (s2 + kEpsilon);
+
+  double weighted_sum_sq = 0.0;
+  double weighted_inlier_mass = 0.0;
+  double total_base_mass = 0.0;
+  int inlier_count = 0;
+
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    const double residual = normal.dot(points[i]) + d;
+    const double base_weight = base_weights[i];
+    total_base_mass += base_weight;
+
+    if (std::abs(residual) <= options.plane_inlier_threshold_mm) {
+      weighted_sum_sq += base_weight * residual * residual;
+      weighted_inlier_mass += base_weight;
+      ++inlier_count;
+    }
+  }
+
+  plane.normal = normal;
+  plane.d = d;
+  plane.inlier_count = inlier_count;
+
+  if (weighted_inlier_mass > kEpsilon) {
+    plane.rms_mm = std::sqrt(weighted_sum_sq / weighted_inlier_mass);
+  } else {
+    plane.rms_mm = std::numeric_limits<double>::infinity();
+  }
+
+  plane.inlier_ratio = (total_base_mass > kEpsilon)
+                           ? (weighted_inlier_mass / total_base_mass)
+                           : 0.0;
+
+  const bool pose_ok = plane.pose_count >= options.min_covisible_poses;
+  const bool spread_ok = plane.spread_ratio >= options.min_spread_ratio;
+  const bool thickness_ok =
+      plane.thickness_ratio <= options.max_thickness_ratio;
+  const bool rms_ok =
+      std::isfinite(plane.rms_mm) && plane.rms_mm <= options.max_plane_rms_mm;
+
+  plane.valid = pose_ok && spread_ok && thickness_ok && rms_ok &&
+                plane.inlier_count >= 30;
+
+  if (plane.valid) {
+    plane.confidence =
+        computePlaneConfidence(plane.rms_mm, plane.thickness_ratio, options);
+    plane.weight = plane.confidence;
+  } else {
+    plane.confidence = 0.0;
+    plane.weight = 0.0;
+  }
+
+  return plane;
 }
 
 DiscretePlane fitPlaneRobustTLS(const std::vector<cv::Vec3d>& points,
                                 double psi,
                                 const MsmCalibrationOptions& options) {
-  DiscretePlane plane;
-  plane.psi = psi;
-  plane.point_count = static_cast<int>(points.size());
-  plane.valid = false;
-
-  if (points.size() < 30) return plane;
-
-  cv::Vec3d center(0.0, 0.0, 0.0);
-  for (const auto& pt : points) center += pt;
-  center /= static_cast<double>(points.size());
-
-  cv::Mat A(static_cast<int>(points.size()), 3, CV_64F);
-  for (std::size_t i = 0; i < points.size(); ++i) {
-    A.at<double>(static_cast<int>(i), 0) = points[i][0] - center[0];
-    A.at<double>(static_cast<int>(i), 1) = points[i][1] - center[1];
-    A.at<double>(static_cast<int>(i), 2) = points[i][2] - center[2];
+  std::vector<std::vector<cv::Vec3d>> grouped_points;
+  if (!points.empty()) {
+    grouped_points.push_back(points);
   }
 
-  cv::Mat w, u, vt;
-  cv::SVD::compute(A, w, u, vt);
-
-  const double s1 = w.at<double>(0);
-  const double s2 = w.at<double>(1);
-  if (s2 / (s1 + 1e-9) < options.min_spread_ratio) return plane;
-
-  cv::Vec3d normal(vt.at<double>(2, 0), vt.at<double>(2, 1),
-                   vt.at<double>(2, 2));
-  normal = cv::normalize(normal);
-  double d = -normal.dot(center);
-
-  const int max_iters = 5;
-  const double huber_k = 1.345;
-
-  for (int iter = 0; iter < max_iters; ++iter) {
-    std::vector<double> residuals(points.size());
-    for (std::size_t i = 0; i < points.size(); ++i) {
-      residuals[i] = std::abs(normal.dot(points[i]) + d);
-    }
-
-    std::vector<double> sorted_res = residuals;
-    std::nth_element(sorted_res.begin(),
-                     sorted_res.begin() + sorted_res.size() / 2,
-                     sorted_res.end());
-    const double mad = sorted_res[sorted_res.size() / 2];
-    const double sigma = std::max(1.4826 * mad, 0.05);
-
-    double sum_weights = 0.0;
-    cv::Vec3d w_center(0.0, 0.0, 0.0);
-    std::vector<double> weights(points.size(), 1.0);
-
-    for (std::size_t i = 0; i < points.size(); ++i) {
-      const double r = residuals[i] / sigma;
-      double w_val = (r > huber_k) ? (huber_k / r) : 1.0;
-      weights[i] = w_val;
-      w_center += points[i] * w_val;
-      sum_weights += w_val;
-    }
-
-    if (sum_weights < 1e-6) break;
-    w_center /= sum_weights;
-
-    cv::Mat W_A(static_cast<int>(points.size()), 3, CV_64F);
-    for (std::size_t i = 0; i < points.size(); ++i) {
-      const double sqrt_w = std::sqrt(weights[i]);
-      W_A.at<double>(static_cast<int>(i), 0) =
-          sqrt_w * (points[i][0] - w_center[0]);
-      W_A.at<double>(static_cast<int>(i), 1) =
-          sqrt_w * (points[i][1] - w_center[1]);
-      W_A.at<double>(static_cast<int>(i), 2) =
-          sqrt_w * (points[i][2] - w_center[2]);
-    }
-
-    cv::Mat w_mat, u_mat, vt_mat;
-    cv::SVD::compute(W_A, w_mat, u_mat, vt_mat);
-
-    normal = cv::Vec3d(vt_mat.at<double>(2, 0), vt_mat.at<double>(2, 1),
-                       vt_mat.at<double>(2, 2));
-    normal = cv::normalize(normal);
-    d = -normal.dot(w_center);
-  }
-
-  double sum_sq = 0.0;
-  int inlier_count = 0;
-  for (const auto& pt : points) {
-    const double dist = normal.dot(pt) + d;
-    if (std::abs(dist) < 0.8) {
-      sum_sq += dist * dist;
-      inlier_count++;
-    }
-  }
-
-  const double rms = (inlier_count > 0)
-                         ? std::sqrt(sum_sq / static_cast<double>(inlier_count))
-                         : 10.0;
-
-  plane.normal = normal;
-  plane.d = d;
-  plane.rms_mm = rms;
-  plane.valid = (rms <= options.max_plane_rms_mm);
-
-  // WLS 综合权重
-  plane.weight = static_cast<double>(inlier_count) / (rms * rms + 1e-4);
-
-  return plane;
+  // Preserve the old standalone behavior: the flat overload is treated
+  // as a single group and should not be rejected merely because the main
+  // calibration requires multiple co-visible poses.
+  MsmCalibrationOptions compatible_options = options;
+  compatible_options.min_covisible_poses = 1;
+  return fitPlaneRobustTLS(grouped_points, psi, compatible_options);
 }
 
 void enforceNormalConsistency(std::vector<DiscretePlane>& planes) {
   if (planes.empty()) return;
+
   cv::Vec3d ref_normal;
   bool found = false;
-  for (const auto& p : planes) {
-    if (p.valid) {
-      ref_normal = p.normal;
+  for (const auto& plane : planes) {
+    if (plane.valid) {
+      ref_normal = plane.normal;
       found = true;
       break;
     }
   }
+
   if (!found) return;
 
-  for (auto& p : planes) {
-    if (p.valid && p.normal.dot(ref_normal) < 0.0) {
-      p.normal = -p.normal;
-      p.d = -p.d;
+  for (auto& plane : planes) {
+    if (plane.valid && plane.normal.dot(ref_normal) < 0.0) {
+      plane.normal = -plane.normal;
+      plane.d = -plane.d;
     }
   }
 }
@@ -456,86 +1837,209 @@ bool solveNominalRotationGeometry(const std::vector<DiscretePlane>& planes,
                                   double ref_psi, cv::Vec3d& out_w,
                                   cv::Vec3d& out_S0, cv::Vec3d& out_n0,
                                   cv::Vec3d& out_u, cv::Vec3d& out_v) {
-  std::vector<DiscretePlane> valid_planes;
-  for (const auto& p : planes) {
-    if (p.valid) valid_planes.push_back(p);
-  }
-  if (valid_planes.size() < 3) return false;
+  std::vector<const DiscretePlane*> valid_planes;
+  valid_planes.reserve(planes.size());
 
-  cv::Mat M_cov = cv::Mat::zeros(3, 3, CV_64F);
-  for (const auto& vp : valid_planes) {
-    const cv::Mat n_i =
-        (cv::Mat_<double>(3, 1) << vp.normal[0], vp.normal[1], vp.normal[2]);
-    M_cov += vp.weight * (n_i * n_i.t());
+  for (const auto& plane : planes) {
+    if (plane.valid) {
+      valid_planes.push_back(&plane);
+    }
   }
 
-  cv::Mat eig_vals, eig_vecs;
-  cv::eigen(M_cov, eig_vals, eig_vecs);
+  if (valid_planes.size() < 3) {
+    return false;
+  }
 
-  out_w = cv::Vec3d(eig_vecs.at<double>(2, 0), eig_vecs.at<double>(2, 1),
-                    eig_vecs.at<double>(2, 2));
+  cv::Mat normal_cov = cv::Mat::zeros(3, 3, CV_64F);
+  for (const auto* plane : valid_planes) {
+    const cv::Mat n = (cv::Mat_<double>(3, 1) << plane->normal[0],
+                       plane->normal[1], plane->normal[2]);
+    normal_cov += plane->confidence * (n * n.t());
+  }
+
+  cv::Mat eigenvalues;
+  cv::Mat eigenvectors;
+  cv::eigen(normal_cov, eigenvalues, eigenvectors);
+
+  out_w =
+      cv::Vec3d(eigenvectors.at<double>(2, 0), eigenvectors.at<double>(2, 1),
+                eigenvectors.at<double>(2, 2));
   out_w = cv::normalize(out_w);
-  if (out_w[1] < 0.0) out_w = -out_w;
 
-  cv::Vec3d a =
+  const DiscretePlane* first_plane = valid_planes.front();
+  const DiscretePlane* last_plane = valid_planes.back();
+
+  cv::Vec3d first_normal =
+      first_plane->normal - first_plane->normal.dot(out_w) * out_w;
+  cv::Vec3d last_normal =
+      last_plane->normal - last_plane->normal.dot(out_w) * out_w;
+
+  if (cv::norm(first_normal) > kEpsilon && cv::norm(last_normal) > kEpsilon) {
+    first_normal = cv::normalize(first_normal);
+    last_normal = cv::normalize(last_normal);
+    const double signed_turn = first_normal.cross(last_normal).dot(out_w);
+
+    if (signed_turn < 0.0) {
+      out_w = -out_w;
+    } else if (std::abs(signed_turn) < 1e-10 && out_w[1] < 0.0) {
+      out_w = -out_w;
+    }
+  } else if (out_w[1] < 0.0) {
+    out_w = -out_w;
+  }
+
+  const cv::Vec3d reference_axis =
       (std::abs(out_w[0]) > 0.9) ? cv::Vec3d(0, 1, 0) : cv::Vec3d(1, 0, 0);
-  out_u = cv::normalize(out_w.cross(a));
+  out_u = cv::normalize(out_w.cross(reference_axis));
   out_v = cv::normalize(out_w.cross(out_u));
 
   cv::Mat A_s0(static_cast<int>(valid_planes.size()), 2, CV_64F);
   cv::Mat b_s0(static_cast<int>(valid_planes.size()), 1, CV_64F);
 
   for (std::size_t i = 0; i < valid_planes.size(); ++i) {
-    const double sqrt_w = std::sqrt(valid_planes[i].weight);
-    const auto& n = valid_planes[i].normal;
-    A_s0.at<double>(static_cast<int>(i), 0) = sqrt_w * n.dot(out_u);
-    A_s0.at<double>(static_cast<int>(i), 1) = sqrt_w * n.dot(out_v);
-    b_s0.at<double>(static_cast<int>(i), 0) = -sqrt_w * valid_planes[i].d;
+    const auto& plane = *valid_planes[i];
+    const double sqrt_weight = std::sqrt(std::max(plane.confidence, 0.0));
+
+    A_s0.at<double>(static_cast<int>(i), 0) =
+        sqrt_weight * plane.normal.dot(out_u);
+    A_s0.at<double>(static_cast<int>(i), 1) =
+        sqrt_weight * plane.normal.dot(out_v);
+    b_s0.at<double>(static_cast<int>(i), 0) = -sqrt_weight * plane.d;
   }
 
-  cv::Mat alpha_beta;
-  if (!cv::solve(A_s0, b_s0, alpha_beta, cv::DECOMP_SVD)) return false;
+  cv::Mat center_parameters;
+  if (!cv::solve(A_s0, b_s0, center_parameters, cv::DECOMP_SVD)) {
+    return false;
+  }
 
-  out_S0 = alpha_beta.at<double>(0) * out_u + alpha_beta.at<double>(1) * out_v;
+  out_S0 = center_parameters.at<double>(0) * out_u +
+           center_parameters.at<double>(1) * out_v;
 
-  double min_diff = 1e9;
-  for (const auto& p : valid_planes) {
-    const double diff = std::abs(p.psi - ref_psi);
-    if (diff < min_diff) {
-      min_diff = diff;
-      out_n0 = p.normal;
+  const DiscretePlane* left_plane = nullptr;
+  const DiscretePlane* right_plane = nullptr;
+
+  for (const auto* plane : valid_planes) {
+    if (plane->psi <= ref_psi) {
+      left_plane = plane;
+    }
+    if (plane->psi >= ref_psi) {
+      right_plane = plane;
+      break;
     }
   }
-  out_n0 = cv::normalize(out_n0 - out_n0.dot(out_w) * out_w);
+
+  if (left_plane == nullptr) {
+    left_plane = valid_planes.front();
+  }
+  if (right_plane == nullptr) {
+    right_plane = valid_planes.back();
+  }
+
+  cv::Vec3d left_normal =
+      left_plane->normal - left_plane->normal.dot(out_w) * out_w;
+  cv::Vec3d right_normal =
+      right_plane->normal - right_plane->normal.dot(out_w) * out_w;
+
+  if (cv::norm(left_normal) < kEpsilon || cv::norm(right_normal) < kEpsilon) {
+    return false;
+  }
+
+  left_normal = cv::normalize(left_normal);
+  right_normal = cv::normalize(right_normal);
+
+  if (left_plane == right_plane ||
+      std::abs(right_plane->psi - left_plane->psi) < 1e-12) {
+    out_n0 = left_normal;
+  } else {
+    const double interpolation = std::clamp(
+        (ref_psi - left_plane->psi) / (right_plane->psi - left_plane->psi), 0.0,
+        1.0);
+
+    const double cos_delta =
+        std::clamp(left_normal.dot(right_normal), -1.0, 1.0);
+    const double sin_delta = left_normal.cross(right_normal).dot(out_w);
+    const double delta_angle = std::atan2(sin_delta, cos_delta);
+
+    out_n0 = rotateAroundAxis(left_normal, out_w, interpolation * delta_angle);
+    out_n0 = cv::normalize(out_n0 - out_n0.dot(out_w) * out_w);
+  }
+
   return true;
 }
-
 std::vector<double> computeRelativeAngles(
     const std::vector<DiscretePlane>& planes, const cv::Vec3d& w,
     const cv::Vec3d& n0, bool enforce_monotonic) {
   std::vector<double> thetas(planes.size(), 0.0);
+  std::vector<int> valid_indices;
+  valid_indices.reserve(planes.size());
 
   for (std::size_t i = 0; i < planes.size(); ++i) {
-    if (!planes[i].valid) continue;
+    if (!planes[i].valid) {
+      continue;
+    }
 
-    const cv::Vec3d n_proj =
-        cv::normalize(planes[i].normal - planes[i].normal.dot(w) * w);
-    const double cos_t = std::clamp(n0.dot(n_proj), -1.0, 1.0);
-    const cv::Vec3d cross_n = n0.cross(n_proj);
-    thetas[i] = std::atan2(cross_n.dot(w), cos_t);
+    const cv::Vec3d projected = planes[i].normal - planes[i].normal.dot(w) * w;
+    if (cv::norm(projected) < kEpsilon) {
+      continue;
+    }
+
+    const cv::Vec3d normal = cv::normalize(projected);
+    const double cos_theta = std::clamp(n0.dot(normal), -1.0, 1.0);
+    const double sin_theta = n0.cross(normal).dot(w);
+
+    thetas[i] = std::atan2(sin_theta, cos_theta);
+    valid_indices.push_back(static_cast<int>(i));
   }
 
-  if (enforce_monotonic) {
-    for (std::size_t i = 1; i < thetas.size(); ++i) {
-      if (planes[i].valid && planes[i - 1].valid && thetas[i] < thetas[i - 1]) {
-        thetas[i] = thetas[i - 1];
+  if (!enforce_monotonic || valid_indices.size() < 2) {
+    return thetas;
+  }
+
+  struct Block {
+    int begin = 0;
+    int end = 0;
+    double weight = 0.0;
+    double mean = 0.0;
+  };
+
+  std::vector<Block> blocks;
+  blocks.reserve(valid_indices.size());
+
+  for (std::size_t k = 0; k < valid_indices.size(); ++k) {
+    const int idx = valid_indices[k];
+    const double weight =
+        std::max(planes[static_cast<std::size_t>(idx)].confidence, 1e-6);
+
+    blocks.push_back({static_cast<int>(k), static_cast<int>(k), weight,
+                      thetas[static_cast<std::size_t>(idx)]});
+
+    while (blocks.size() >= 2) {
+      const std::size_t n = blocks.size();
+      if (blocks[n - 2].mean <= blocks[n - 1].mean) {
+        break;
       }
+
+      const Block right = blocks.back();
+      blocks.pop_back();
+      Block& left = blocks.back();
+
+      const double merged_weight = left.weight + right.weight;
+      left.mean =
+          (left.mean * left.weight + right.mean * right.weight) / merged_weight;
+      left.weight = merged_weight;
+      left.end = right.end;
+    }
+  }
+
+  for (const auto& block : blocks) {
+    for (int k = block.begin; k <= block.end; ++k) {
+      const int idx = valid_indices[static_cast<std::size_t>(k)];
+      thetas[static_cast<std::size_t>(idx)] = block.mean;
     }
   }
 
   return thetas;
 }
-
 RationalAngleModel fitRationalAngleModel(
     const std::vector<DiscretePlane>& planes, const std::vector<double>& thetas,
     double psi_ref) {
@@ -545,120 +2049,160 @@ RationalAngleModel fitRationalAngleModel(
 
   std::vector<int> valid_indices;
   for (std::size_t i = 0; i < planes.size(); ++i) {
-    if (planes[i].valid) valid_indices.push_back(static_cast<int>(i));
+    if (planes[i].valid) {
+      valid_indices.push_back(static_cast<int>(i));
+    }
   }
-  if (valid_indices.size() < 3) return model;
+
+  if (valid_indices.size() < 3) {
+    return model;
+  }
 
   cv::Mat A(static_cast<int>(valid_indices.size()), 2, CV_64F);
   cv::Mat b(static_cast<int>(valid_indices.size()), 1, CV_64F);
 
-  for (std::size_t i = 0; i < valid_indices.size(); ++i) {
-    const int idx = valid_indices[i];
-    const double psi = planes[idx].psi;
-    const double tan_th = std::tan(thetas[idx]);
+  for (std::size_t row = 0; row < valid_indices.size(); ++row) {
+    const int idx = valid_indices[row];
+    const auto& plane = planes[static_cast<std::size_t>(idx)];
+    const double theta = thetas[static_cast<std::size_t>(idx)];
+    const double delta_psi = plane.psi - psi_ref;
+    const double tan_theta = std::tan(theta);
+    const double cos_theta = std::cos(theta);
 
-    const double cos_th = std::cos(thetas[idx]);
-    const double weight = cos_th * cos_th;
+    const double total_weight =
+        std::max(plane.confidence, 1e-6) * cos_theta * cos_theta;
+    const double sqrt_weight = std::sqrt(total_weight);
 
-    A.at<double>(static_cast<int>(i), 0) = weight * tan_th * psi;
-    A.at<double>(static_cast<int>(i), 1) = weight * tan_th;
-    b.at<double>(static_cast<int>(i), 0) = weight * (psi - psi_ref);
+    A.at<double>(static_cast<int>(row), 0) = sqrt_weight * tan_theta;
+    A.at<double>(static_cast<int>(row), 1) =
+        sqrt_weight * tan_theta * delta_psi;
+    b.at<double>(static_cast<int>(row), 0) = sqrt_weight * delta_psi;
   }
 
-  cv::Mat params;
-  if (cv::solve(A, b, params, cv::DECOMP_SVD)) {
-    model.a1 = params.at<double>(0);
-    model.a2 = params.at<double>(1);
-    model.valid = true;
+  cv::Mat parameters;
+  if (!cv::solve(A, b, parameters, cv::DECOMP_SVD)) {
+    return model;
   }
 
+  model.b0 = parameters.at<double>(0);
+  model.b1 = parameters.at<double>(1);
+
+  if (!std::isfinite(model.b0) || !std::isfinite(model.b1) ||
+      std::abs(model.b0) < 1e-12) {
+    return model;
+  }
+
+  model.valid = true;
   return model;
 }
-
-// 包含常数项的线性加权最小二乘求解：order=2 时解 10 个参数
 HarmonicDriftModel fitHarmonicDriftModel(
     const std::vector<DiscretePlane>& planes, const std::vector<double>& thetas,
-    const cv::Vec3d& w, const cv::Vec3d& S0, const cv::Vec3d& u,
-    const cv::Vec3d& v, int order) {
+    const cv::Vec3d& w, const cv::Vec3d& initial_s0, const cv::Vec3d& u,
+    const cv::Vec3d& v, cv::Vec3d& out_reference_s0, int order,
+    double regularization) {
+  (void)w;
+
   HarmonicDriftModel model;
   model.order = order;
   model.valid = false;
+  out_reference_s0 = initial_s0;
 
-  if (order <= 0) return model;
+  if (order <= 0) {
+    return model;
+  }
 
   std::vector<int> valid_indices;
   for (std::size_t i = 0; i < planes.size(); ++i) {
-    if (planes[i].valid) valid_indices.push_back(static_cast<int>(i));
+    if (planes[i].valid) {
+      valid_indices.push_back(static_cast<int>(i));
+    }
   }
 
-  // 未知数数量：常数项 (2个) + 谐波项 (4 * order 个)
-  const int num_vars = 2 + 4 * order;
-  if (static_cast<int>(valid_indices.size()) < num_vars + 2) return model;
+  // Two reference-center corrections plus four coefficients per harmonic:
+  // u*(cos(k*theta)-1), u*sin(k*theta),
+  // v*(cos(k*theta)-1), v*sin(k*theta).
+  const int num_harmonic_vars = 4 * order;
+  const int num_vars = 2 + num_harmonic_vars;
 
-  const int num_pts = static_cast<int>(valid_indices.size());
-  cv::Mat H = cv::Mat::zeros(num_pts, num_vars, CV_64F);
-  cv::Mat b_res(num_pts, 1, CV_64F);
+  if (static_cast<int>(valid_indices.size()) < num_vars + 2) {
+    return model;
+  }
 
-  for (int i = 0; i < num_pts; ++i) {
-    const int idx = valid_indices[i];
-    const double th = thetas[idx];
-    const auto& n = planes[idx].normal;
-    const double d = planes[idx].d;
+  const int num_data_rows = static_cast<int>(valid_indices.size());
+  const int num_regularization_rows = num_harmonic_vars;
+  cv::Mat A =
+      cv::Mat::zeros(num_data_rows + num_regularization_rows, num_vars, CV_64F);
+  cv::Mat b =
+      cv::Mat::zeros(num_data_rows + num_regularization_rows, 1, CV_64F);
+
+  for (int row = 0; row < num_data_rows; ++row) {
+    const int idx = valid_indices[static_cast<std::size_t>(row)];
+    const auto& plane = planes[static_cast<std::size_t>(idx)];
+    const double theta = thetas[static_cast<std::size_t>(idx)];
+    const auto& n = plane.normal;
 
     const double nu = n.dot(u);
     const double nv = n.dot(v);
+    const double sqrt_weight = std::sqrt(std::max(plane.confidence, 1e-8));
 
-    // 列 0 与 1：常数项基底 (分别对应 beta_u[0] 和 beta_v[0])
-    H.at<double>(i, 0) = nu;
-    H.at<double>(i, 1) = nv;
+    // Reference-center correction relative to initial_s0.
+    A.at<double>(row, 0) = sqrt_weight * nu;
+    A.at<double>(row, 1) = sqrt_weight * nv;
 
-    // 后续列：各阶谐波项基底
     for (int k = 1; k <= order; ++k) {
-      const double ang = static_cast<double>(k) * th;
-      const double c = std::cos(ang);
-      const double s = std::sin(ang);
+      const double angle = static_cast<double>(k) * theta;
+      const double cos_basis = std::cos(angle) - 1.0;
+      const double sin_basis = std::sin(angle);
+      const int col = 2 + 4 * (k - 1);
 
-      const int col_base = 2 + 4 * (k - 1);
-      H.at<double>(i, col_base + 0) = nu * c;
-      H.at<double>(i, col_base + 1) = nu * s;
-      H.at<double>(i, col_base + 2) = nv * c;
-      H.at<double>(i, col_base + 3) = nv * s;
+      A.at<double>(row, col + 0) = sqrt_weight * nu * cos_basis;
+      A.at<double>(row, col + 1) = sqrt_weight * nu * sin_basis;
+      A.at<double>(row, col + 2) = sqrt_weight * nv * cos_basis;
+      A.at<double>(row, col + 3) = sqrt_weight * nv * sin_basis;
     }
 
-    b_res.at<double>(i, 0) = -(n.dot(S0) + d);
+    b.at<double>(row, 0) = -sqrt_weight * (n.dot(initial_s0) + plane.d);
   }
 
-  // 引入微弱 Tikhonov 岭正则项稳定窄视场条件数
-  cv::Mat HtH = H.t() * H;
-  const double lambda = 1e-3;
-  for (int j = 0; j < num_vars; ++j) {
-    HtH.at<double>(j, j) += lambda;
-  }
-  cv::Mat Htb = H.t() * b_res;
+  // Solve the regularized least-squares problem directly with SVD instead of
+  // forming normal equations. Higher harmonics receive slightly stronger
+  // regularization.
+  const double lambda = std::max(regularization, 0.0);
+  int reg_row = num_data_rows;
 
-  cv::Mat beta;
-  if (cv::solve(HtH, Htb, beta, cv::DECOMP_CHOLESKY)) {
-    // 每个方向包含 1 个常数项 + 2*order 个谐波项，总长 2*order + 1
-    model.beta_u.resize(2 * order + 1, 0.0);
-    model.beta_v.resize(2 * order + 1, 0.0);
+  for (int k = 1; k <= order; ++k) {
+    const double sqrt_lambda = std::sqrt(lambda) * static_cast<double>(k);
+    const int col = 2 + 4 * (k - 1);
 
-    // 0 号索引存放常数偏置
-    model.beta_u[0] = beta.at<double>(0);
-    model.beta_v[0] = beta.at<double>(1);
-
-    // 交替存入各频阶的 cos 与 sin 系数
-    for (int k = 1; k <= order; ++k) {
-      const int col_base = 2 + 4 * (k - 1);
-      const int dst_base = 1 + 2 * (k - 1);
-
-      model.beta_u[dst_base + 0] = beta.at<double>(col_base + 0);
-      model.beta_u[dst_base + 1] = beta.at<double>(col_base + 1);
-      model.beta_v[dst_base + 0] = beta.at<double>(col_base + 2);
-      model.beta_v[dst_base + 1] = beta.at<double>(col_base + 3);
+    for (int j = 0; j < 4; ++j) {
+      A.at<double>(reg_row, col + j) = sqrt_lambda;
+      ++reg_row;
     }
-    model.valid = true;
   }
 
+  cv::Mat parameters;
+  if (!cv::solve(A, b, parameters, cv::DECOMP_SVD)) {
+    return model;
+  }
+
+  const double center_u = parameters.at<double>(0);
+  const double center_v = parameters.at<double>(1);
+  out_reference_s0 = initial_s0 + center_u * u + center_v * v;
+
+  model.beta_u.resize(2 * order, 0.0);
+  model.beta_v.resize(2 * order, 0.0);
+
+  for (int k = 1; k <= order; ++k) {
+    const int col = 2 + 4 * (k - 1);
+    const int dst_idx = 2 * (k - 1);
+
+    model.beta_u[dst_idx + 0] = parameters.at<double>(col + 0);
+    model.beta_u[dst_idx + 1] = parameters.at<double>(col + 1);
+    model.beta_v[dst_idx + 0] = parameters.at<double>(col + 2);
+    model.beta_v[dst_idx + 1] = parameters.at<double>(col + 3);
+  }
+
+  model.valid = true;
   return model;
 }
 
@@ -668,63 +2212,10 @@ double evaluateMsmReconstruction(const MsmCalibrationResult& result,
                                  const cv::Mat& dist_coeffs,
                                  const BoardPlane& board_plane, double min_psi,
                                  double max_psi, int pixel_stride) {
-  if (phase_map.empty()) return 0.0;
-
-  cv::Mat p64;
-  if (phase_map.channels() > 1) {
-    cv::extractChannel(phase_map, p64, 0);
-  } else {
-    p64 = phase_map;
-  }
-  p64.convertTo(p64, CV_64F);
-
-  std::vector<cv::Point2d> subpixels;
-  std::vector<double> psis;
-
-  for (int y = 0; y < p64.rows; y += pixel_stride) {
-    const double* r_ptr = p64.ptr<double>(y);
-    for (int x = 0; x < p64.cols; x += pixel_stride) {
-      const double val = r_ptr[x];
-      if (std::isfinite(val) && val >= min_psi && val <= max_psi) {
-        subpixels.emplace_back(static_cast<double>(x), static_cast<double>(y));
-        psis.push_back(val);
-      }
-    }
-  }
-
-  if (subpixels.empty()) return 0.0;
-
-  std::vector<cv::Point2d> norm_pts;
-  cv::undistortPoints(subpixels, norm_pts, camera_matrix, dist_coeffs);
-
-  double sum_sq_err = 0.0;
-  int count = 0;
-
-  for (std::size_t i = 0; i < norm_pts.size(); ++i) {
-    cv::Vec3d ray(norm_pts[i].x, norm_pts[i].y, 1.0);
-    ray = cv::normalize(ray);
-
-    const double denom_board = board_plane.normal.dot(ray);
-    if (std::abs(denom_board) < 1e-4) continue;
-    const double depth_gt = -board_plane.d / denom_board;
-    if (depth_gt < 120.0 || depth_gt > 250.0) continue;
-    const cv::Vec3d X_gt = ray * depth_gt;
-
-    cv::Vec3d n_pred;
-    double d_pred = 0.0;
-    result.evaluatePlane(psis[i], n_pred, d_pred);
-
-    const double denom_pred = n_pred.dot(ray);
-    if (std::abs(denom_pred) < 1e-4) continue;
-    const double depth_pred = -d_pred / denom_pred;
-    const cv::Vec3d X_pred = ray * depth_pred;
-
-    const double err = cv::norm(X_pred - X_gt);
-    sum_sq_err += err * err;
-    count++;
-  }
-
-  return (count > 0) ? std::sqrt(sum_sq_err / static_cast<double>(count)) : 0.0;
+  return evaluateReconstructionDetailed(result, phase_map, camera_matrix,
+                                        dist_coeffs, board_plane, min_psi,
+                                        max_psi, pixel_stride)
+      .rmse_3d_mm;
 }
 
 MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
@@ -744,33 +2235,42 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
 
   for (std::size_t i = 0; i < train_count; ++i) {
     const int pid = config.train_poses[i];
+
     if (pid < 0 ||
         pid >= static_cast<int>(camera_calib.rotation_vectors.size()) ||
-        pid >= static_cast<int>(all_phase_maps.size())) {
-      throw std::runtime_error("Pose ID out of bounds: " + std::to_string(pid));
+        pid >= static_cast<int>(camera_calib.translation_vectors.size()) ||
+        pid >= static_cast<int>(all_phase_maps.size()) ||
+        all_phase_maps[static_cast<std::size_t>(pid)].empty()) {
+      throw std::runtime_error("Invalid or missing training pose: " +
+                               std::to_string(pid));
     }
 
-    auto bp = computeBoardPlane(camera_calib.rotation_vectors[pid],
-                                camera_calib.translation_vectors[pid]);
-    train_board_planes.push_back(bp);
-    train_phase_maps.push_back(all_phase_maps[pid]);
+    const auto board_plane =
+        computeBoardPlane(camera_calib.rotation_vectors[pid],
+                          camera_calib.translation_vectors[pid]);
+
+    train_board_planes.push_back(board_plane);
+    train_phase_maps.push_back(all_phase_maps[static_cast<std::size_t>(pid)]);
 
     std::cout << "  Pose " << std::setw(2) << pid << ": board normal=["
-              << bp.normal[0] << ", " << bp.normal[1] << ", " << bp.normal[2]
-              << "], distance d=" << bp.d << " mm" << std::endl;
+              << board_plane.normal[0] << ", " << board_plane.normal[1] << ", "
+              << board_plane.normal[2] << "], distance d=" << board_plane.d
+              << " mm" << std::endl;
   }
 
   double eff_min_psi = config.options.min_psi;
   double eff_max_psi = config.options.max_psi;
 
   if (config.options.auto_phase_range) {
-    std::cout << "[Step 2] Auto-detecting multi-view co-visible phase range ("
-              << "min_covisible_poses=" << config.options.min_covisible_poses
+    std::cout << "[Step 2] Auto-detecting multi-view co-visible phase range "
+              << "(min_covisible_poses=" << config.options.min_covisible_poses
               << ") ..." << std::endl;
+
     const auto auto_range = autoDetectValidPhaseRange(
         train_phase_maps, config.options.min_covisible_poses);
     eff_min_psi = auto_range.first;
     eff_max_psi = auto_range.second;
+
     std::cout << "  Auto-detected co-visible range: [" << eff_min_psi << ", "
               << eff_max_psi << "] rad (span: " << eff_max_psi - eff_min_psi
               << " rad)" << std::endl;
@@ -779,106 +2279,507 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
               << ", " << eff_max_psi << "] rad" << std::endl;
   }
 
-  const int num_planes = std::max(10, config.options.plane_count);
-  std::vector<DiscretePlane> discrete_planes;
-  discrete_planes.reserve(num_planes);
+  if (!(eff_max_psi > eff_min_psi)) {
+    throw std::runtime_error(
+        "Invalid effective phase range after range detection.");
+  }
 
-  std::cout << "[Step 3] Extracting 1D subpixels and fitting " << num_planes
-            << " discrete planes..." << std::endl;
-
-  for (int p_idx = 0; p_idx < num_planes; ++p_idx) {
-    const double target_psi =
-        eff_min_psi + static_cast<double>(p_idx) * (eff_max_psi - eff_min_psi) /
-                          static_cast<double>(num_planes - 1);
-
-    std::vector<cv::Vec3d> pooled_pts;
+  auto collect_points_by_pose = [&](double target_psi) {
+    PosePointGroups points_by_pose(train_count);
 
     for (std::size_t i = 0; i < train_count; ++i) {
       const auto subpixels =
-          extractIsoPhaseSubpixels(train_phase_maps[i], target_psi);
-      if (subpixels.empty()) continue;
+          extractIsoPhaseSubpixels(train_phase_maps[i], target_psi, cv::Mat(),
+                                   config.options.min_local_phase_gradient,
+                                   config.options.iso_fit_half_window,
+                                   config.options.max_local_phase_gradient,
+                                   config.options.max_lateral_jump_px);
 
-      const auto X_ref =
+      if (subpixels.empty()) {
+        continue;
+      }
+
+      auto points =
           projectSubpixelsToBoard(subpixels, camera_calib.camera_matrix,
                                   camera_calib.distortion_coefficients,
                                   train_board_planes[i], 120.0, 250.0);
-      pooled_pts.insert(pooled_pts.end(), X_ref.begin(), X_ref.end());
+
+      if (static_cast<int>(points.size()) <
+          config.options.min_points_per_pose) {
+        continue;
+      }
+
+      points_by_pose[i] = std::move(points);
     }
 
-    auto plane = fitPlaneRobustTLS(pooled_pts, target_psi, config.options);
-    discrete_planes.push_back(plane);
+    return points_by_pose;
+  };
 
-    if (p_idx == 0 || p_idx == num_planes / 2 || p_idx == num_planes - 1) {
-      std::cout << "  Plane " << std::setw(2) << p_idx << " (psi=" << std::fixed
-                << std::setprecision(2) << target_psi
-                << "): pts=" << plane.point_count
-                << ", rms=" << std::setprecision(5) << plane.rms_mm
-                << " mm, valid=" << (plane.valid ? "YES" : "NO") << std::endl;
+  auto fit_plane_set = [&](const std::vector<double>& target_phases,
+                           bool print_examples,
+                           PlaneObservationSets* out_observations,
+                           int required_pose_count) {
+    std::vector<DiscretePlane> planes;
+    planes.reserve(target_phases.size());
+
+    if (out_observations != nullptr) {
+      out_observations->clear();
+      out_observations->reserve(target_phases.size());
+    }
+
+    auto fit_options = config.options;
+    fit_options.min_covisible_poses = std::max(1, required_pose_count);
+
+    for (std::size_t p_idx = 0; p_idx < target_phases.size(); ++p_idx) {
+      const double target_psi = target_phases[p_idx];
+      auto points_by_pose = collect_points_by_pose(target_psi);
+
+      auto plane = fitPlaneRobustTLS(points_by_pose, target_psi, fit_options);
+      planes.push_back(plane);
+
+      if (out_observations != nullptr) {
+        out_observations->push_back(std::move(points_by_pose));
+      }
+
+      if (print_examples && (p_idx == 0 || p_idx == target_phases.size() / 2 ||
+                             p_idx + 1 == target_phases.size())) {
+        std::cout << "  Plane " << std::setw(2) << p_idx
+                  << " (psi=" << std::fixed << std::setprecision(2)
+                  << target_psi << "): poses=" << plane.pose_count
+                  << ", pts=" << plane.point_count
+                  << ", rms=" << std::setprecision(5) << plane.rms_mm << " mm"
+                  << ", spread=" << plane.spread_ratio
+                  << ", thickness=" << plane.thickness_ratio
+                  << ", valid=" << (plane.valid ? "YES" : "NO") << std::endl;
+      }
+    }
+
+    enforceNormalConsistency(planes);
+    normalizePlaneConfidences(planes);
+    return planes;
+  };
+
+  const double ref_psi = 0.5 * (eff_min_psi + eff_max_psi);
+  const int final_plane_count = std::max(10, config.options.plane_count);
+  const int coarse_plane_count = std::clamp(final_plane_count / 2, 24, 40);
+
+  std::cout << "[Step 3] Estimating phase-to-angle mapping..." << std::endl;
+
+  std::vector<DiscretePlane> coarse_planes;
+  double coarse_min_psi = eff_min_psi;
+  double coarse_max_psi = eff_max_psi;
+  int coarse_required_poses = config.options.min_covisible_poses;
+  bool initialization_found = false;
+
+  const int maximum_initial_pose_count = static_cast<int>(train_count);
+  const int minimum_initial_pose_count = std::max(
+      2,
+      std::min(config.options.min_covisible_poses, maximum_initial_pose_count));
+
+  for (int required_poses = maximum_initial_pose_count;
+       required_poses >= minimum_initial_pose_count; --required_poses) {
+    const auto candidate_range =
+        autoDetectValidPhaseRange(train_phase_maps, required_poses);
+
+    if (!(candidate_range.second > candidate_range.first)) {
+      continue;
+    }
+
+    const auto candidate_phases = makeUniformSamples(
+        candidate_range.first, candidate_range.second, coarse_plane_count);
+
+    auto candidate_planes =
+        fit_plane_set(candidate_phases, false, nullptr, required_poses);
+
+    int valid_count = 0;
+    for (const auto& plane : candidate_planes) {
+      if (plane.valid) {
+        ++valid_count;
+      }
+    }
+
+    std::cout << "  initialization candidate: " << required_poses << "/"
+              << train_count << " co-visible poses, range=[" << std::fixed
+              << std::setprecision(3) << candidate_range.first << ", "
+              << candidate_range.second << "] rad"
+              << ", valid planes=" << valid_count << "/" << coarse_plane_count
+              << std::endl;
+
+    if (valid_count >= 6) {
+      coarse_planes = std::move(candidate_planes);
+      coarse_min_psi = candidate_range.first;
+      coarse_max_psi = candidate_range.second;
+      coarse_required_poses = required_poses;
+      initialization_found = true;
+      break;
     }
   }
 
-  int valid_count = 0;
-  for (const auto& p : discrete_planes) {
-    if (p.valid) valid_count++;
+  if (!initialization_found) {
+    std::cout << "  No stable initialization range was found. "
+              << "Plane diagnostics for the configured overlap are:"
+              << std::endl;
+
+    const auto fallback_phases =
+        makeUniformSamples(eff_min_psi, eff_max_psi, coarse_plane_count);
+    auto fallback_planes = fit_plane_set(fallback_phases, false, nullptr,
+                                         config.options.min_covisible_poses);
+    printPlaneQualityDiagnostics(fallback_planes, config.options);
+
+    throw std::runtime_error(
+        "Insufficient valid initial planes for angle estimation.");
   }
-  std::cout << "Total valid planes extracted: " << valid_count << " / "
-            << num_planes << std::endl;
 
-  if (valid_count < 3) {
-    throw std::runtime_error("Insufficient valid planes for MSM calibration.");
+  std::cout << "  selected initialization range: [" << coarse_min_psi << ", "
+            << coarse_max_psi << "] rad using " << coarse_required_poses << "/"
+            << train_count << " co-visible poses" << std::endl;
+
+  const double coarse_ref_psi = 0.5 * (coarse_min_psi + coarse_max_psi);
+
+  cv::Vec3d coarse_w;
+  cv::Vec3d coarse_s0;
+  cv::Vec3d coarse_n0;
+  cv::Vec3d coarse_u;
+  cv::Vec3d coarse_v;
+
+  if (!solveNominalRotationGeometry(coarse_planes, coarse_ref_psi, coarse_w,
+                                    coarse_s0, coarse_n0, coarse_u, coarse_v)) {
+    throw std::runtime_error("Failed to solve initial rotation geometry.");
   }
 
-  enforceNormalConsistency(discrete_planes);
+  const auto coarse_thetas =
+      computeRelativeAngles(coarse_planes, coarse_w, coarse_n0, true);
+  const auto coarse_angle_model =
+      fitRationalAngleModel(coarse_planes, coarse_thetas, coarse_ref_psi);
 
-  const double ref_psi = (eff_min_psi + eff_max_psi) * 0.5;
+  if (!coarse_angle_model.valid) {
+    throw std::runtime_error(
+        "Failed to estimate initial phase-to-angle model.");
+  }
+
+  RationalAngleModel sampling_model = coarse_angle_model;
   MsmCalibrationResult result;
+  std::vector<DiscretePlane> discrete_planes;
+  PlaneObservationSets final_observations;
+  std::vector<double> thetas;
+  std::vector<double> previous_phases;
 
-  if (!solveNominalRotationGeometry(
-          discrete_planes, ref_psi, result.nominal_axis_w,
-          result.nominal_center_s0, result.ref_normal_n0, result.basis_u,
-          result.basis_v)) {
-    throw std::runtime_error("Failed to solve nominal rotation geometry.");
+  const int max_resampling_iterations =
+      std::max(1, config.options.angle_resampling_iterations);
+
+  std::cout << "[Step 4] Fitting " << final_plane_count
+            << " planes uniformly in optical angle..." << std::endl;
+
+  for (int iteration = 0; iteration < max_resampling_iterations; ++iteration) {
+    const double current_theta_min = sampling_model.evaluate(eff_min_psi);
+    const double current_theta_max = sampling_model.evaluate(eff_max_psi);
+
+    if (!std::isfinite(current_theta_min) ||
+        !std::isfinite(current_theta_max) ||
+        std::abs(current_theta_max - current_theta_min) < 1e-8) {
+      throw std::runtime_error(
+          "Invalid optical-angle range during resampling.");
+    }
+
+    const auto target_thetas = makeUniformSamples(
+        current_theta_min, current_theta_max, final_plane_count);
+
+    std::vector<double> refined_phases;
+    refined_phases.reserve(target_thetas.size());
+
+    for (const double theta : target_thetas) {
+      const double psi =
+          invertAngleModel(sampling_model, theta, eff_min_psi, eff_max_psi);
+      if (!std::isfinite(psi)) {
+        throw std::runtime_error(
+            "Failed to invert phase-to-angle model during "
+            "uniform-angle resampling.");
+      }
+      refined_phases.push_back(psi);
+    }
+
+    double max_phase_update = 0.0;
+    if (!previous_phases.empty() &&
+        previous_phases.size() == refined_phases.size()) {
+      for (std::size_t i = 0; i < refined_phases.size(); ++i) {
+        max_phase_update = std::max(
+            max_phase_update, std::abs(refined_phases[i] - previous_phases[i]));
+      }
+    }
+
+    PlaneObservationSets observations;
+    auto planes = fit_plane_set(
+        refined_phases, iteration + 1 == max_resampling_iterations,
+        &observations, config.options.min_covisible_poses);
+
+    int valid_count = 0;
+    for (const auto& plane : planes) {
+      if (plane.valid) {
+        ++valid_count;
+      }
+    }
+
+    if (valid_count < 6) {
+      throw std::runtime_error(
+          "Insufficient valid planes for MSM calibration.");
+    }
+
+    MsmCalibrationResult iteration_result;
+    if (!solveNominalRotationGeometry(
+            planes, ref_psi, iteration_result.nominal_axis_w,
+            iteration_result.nominal_center_s0, iteration_result.ref_normal_n0,
+            iteration_result.basis_u, iteration_result.basis_v)) {
+      throw std::runtime_error("Failed to solve nominal rotation geometry.");
+    }
+
+    auto iteration_thetas =
+        computeRelativeAngles(planes, iteration_result.nominal_axis_w,
+                              iteration_result.ref_normal_n0, true);
+
+    iteration_result.angle_model =
+        fitRationalAngleModel(planes, iteration_thetas, ref_psi);
+
+    if (!iteration_result.angle_model.valid) {
+      throw std::runtime_error("Failed to fit phase-to-angle model.");
+    }
+
+    double iteration_max_angle_error = 0.0;
+    const double iteration_angle_rmse = computeAngleModelRmse(
+        planes, iteration_thetas, iteration_result.angle_model,
+        &iteration_max_angle_error);
+
+    std::cout << "  resampling iteration " << iteration + 1
+              << ": valid planes=" << valid_count << "/" << final_plane_count
+              << ", angle RMSE=" << iteration_angle_rmse * 1000.0 << " mrad";
+
+    if (!previous_phases.empty()) {
+      std::cout << ", max phase update=" << max_phase_update << " rad";
+    }
+    std::cout << std::endl;
+
+    discrete_planes = std::move(planes);
+    final_observations = std::move(observations);
+    thetas = std::move(iteration_thetas);
+    result = iteration_result;
+
+    const bool converged =
+        !previous_phases.empty() &&
+        max_phase_update <= config.options.angle_resampling_tolerance;
+
+    previous_phases = std::move(refined_phases);
+    sampling_model = result.angle_model;
+
+    if (converged) {
+      std::cout << "  optical-angle sampling converged." << std::endl;
+      break;
+    }
   }
 
-  const auto thetas = computeRelativeAngles(
-      discrete_planes, result.nominal_axis_w, result.ref_normal_n0, true);
-  result.angle_model = fitRationalAngleModel(discrete_planes, thetas, ref_psi);
+  printPlaneQualityDiagnostics(discrete_planes, config.options);
 
+  double base_angle_rmse = 0.0;
+  double corrected_angle_rmse = 0.0;
+  const bool angle_correction_accepted = fitAngleResidualCorrection(
+      result.angle_model, discrete_planes, thetas, config.options,
+      &base_angle_rmse, &corrected_angle_rmse);
+
+  double max_angle_error = 0.0;
+  const double angle_rmse = computeAngleModelRmse(
+      discrete_planes, thetas, result.angle_model, &max_angle_error);
+
+  const double theta_min = result.angle_model.evaluate(eff_min_psi);
+  const double theta_max = result.angle_model.evaluate(eff_max_psi);
+
+  double min_denominator = std::numeric_limits<double>::infinity();
+  double max_denominator = -std::numeric_limits<double>::infinity();
+
+  for (const auto& plane : discrete_planes) {
+    if (!plane.valid) {
+      continue;
+    }
+    const double delta_psi = plane.psi - result.angle_model.psi_ref;
+    const double denominator =
+        result.angle_model.b0 + result.angle_model.b1 * delta_psi;
+    min_denominator = std::min(min_denominator, denominator);
+    max_denominator = std::max(max_denominator, denominator);
+  }
+
+  double max_correction_mrad = 0.0;
+  for (const double value : result.angle_model.correction_alpha) {
+    max_correction_mrad =
+        std::max(max_correction_mrad, std::abs(value) * 1000.0);
+  }
+
+  std::cout << "\nAngle model diagnostics" << std::endl;
+  std::cout << "  optical angle range: [" << theta_min << ", " << theta_max
+            << "] rad" << std::endl;
+  std::cout << "  rational-only weighted RMSE: " << base_angle_rmse * 1000.0
+            << " mrad" << std::endl;
+  std::cout << "  corrected weighted RMSE: " << angle_rmse * 1000.0 << " mrad"
+            << std::endl;
+  std::cout << "  maximum absolute angle residual: " << max_angle_error * 1000.0
+            << " mrad" << std::endl;
+  std::cout << "  residual correction: "
+            << (angle_correction_accepted ? "accepted" : "rejected")
+            << ", knots=" << result.angle_model.correction_psi.size()
+            << ", max correction=" << max_correction_mrad << " mrad"
+            << std::endl;
+  std::cout << "  denominator range: [" << min_denominator << ", "
+            << max_denominator << "]" << std::endl;
+  printNormalAxisDiagnostics(discrete_planes, result.nominal_axis_w);
+
+  printPosePlaneResidualDiagnostics(
+      "Observed discrete-plane residuals by training pose", discrete_planes,
+      final_observations, config.train_poses);
+
+  std::vector<DiscretePlane> consistent_planes;
+  consistent_planes.reserve(discrete_planes.size());
+
+  std::vector<double> model_thetas(discrete_planes.size(), 0.0);
+
+  for (std::size_t i = 0; i < discrete_planes.size(); ++i) {
+    const auto& source_plane = discrete_planes[i];
+
+    if (!source_plane.valid) {
+      consistent_planes.push_back(source_plane);
+      continue;
+    }
+
+    const double theta = result.angle_model.evaluate(source_plane.psi);
+    model_thetas[i] = theta;
+
+    cv::Vec3d model_normal =
+        rotateAroundAxis(result.ref_normal_n0, result.nominal_axis_w, theta);
+    model_normal =
+        cv::normalize(model_normal - model_normal.dot(result.nominal_axis_w) *
+                                         result.nominal_axis_w);
+
+    auto plane =
+        fitOffsetForFixedNormal(final_observations[i], source_plane.psi,
+                                model_normal, source_plane, config.options);
+
+    consistent_planes.push_back(plane);
+  }
+
+  normalizePlaneConfidences(consistent_planes);
+
+  printPlaneQualityDiagnostics(consistent_planes, config.options);
+  printPosePlaneResidualDiagnostics(
+      "Continuous-normal plane residuals by training pose", consistent_planes,
+      final_observations, config.train_poses);
+
+  cv::Vec3d consistent_center;
+  if (!solveCenterFromPlanes(consistent_planes, result.basis_u, result.basis_v,
+                             consistent_center)) {
+    throw std::runtime_error("Failed to solve model-consistent scan center.");
+  }
+  result.nominal_center_s0 = consistent_center;
+
+  cv::Vec3d reference_center;
   result.harmonic_drift = fitHarmonicDriftModel(
-      discrete_planes, thetas, result.nominal_axis_w, result.nominal_center_s0,
-      result.basis_u, result.basis_v, config.options.harmonic_order);
+      consistent_planes, model_thetas, result.nominal_axis_w,
+      result.nominal_center_s0, result.basis_u, result.basis_v,
+      reference_center, config.options.harmonic_order,
+      config.options.harmonic_regularization);
+  result.nominal_center_s0 = reference_center;
 
-  // 训练集闭环 3D 误差评估
-  double sum_train_3d_err = 0.0;
+  double harmonic_max_offset_mm = 0.0;
+  const double harmonic_offset_rmse_mm = computeHarmonicPlaneOffsetRmse(
+      result, consistent_planes, &harmonic_max_offset_mm);
+
+  std::cout << "\nContinuous plane model diagnostics" << std::endl;
+  std::cout << "  harmonic plane-offset RMSE: " << std::fixed
+            << std::setprecision(5) << harmonic_offset_rmse_mm << " mm"
+            << std::endl;
+  std::cout << "  maximum absolute plane-offset residual: "
+            << harmonic_max_offset_mm << " mm" << std::endl;
+
+  double sum_train_pose_sq = 0.0;
   int train_eval_count = 0;
+
+  std::cout << "\n[Step 5] Reconstruction diagnostics on training poses:"
+            << std::endl;
+
   for (std::size_t i = 0; i < train_count; ++i) {
-    const double pose_err = evaluateMsmReconstruction(
+    const int pid = config.train_poses[i];
+
+    const auto diagnostics = evaluateReconstructionDetailed(
         result, train_phase_maps[i], camera_calib.camera_matrix,
         camera_calib.distortion_coefficients, train_board_planes[i],
         eff_min_psi, eff_max_psi, 8);
-    if (pose_err > 0.0) {
-      sum_train_3d_err += pose_err * pose_err;
-      train_eval_count++;
+
+    const double pose_error = diagnostics.rmse_3d_mm;
+
+    if (pose_error > 0.0 && std::isfinite(pose_error)) {
+      sum_train_pose_sq += pose_error * pose_error;
+      ++train_eval_count;
+
+      std::cout << "  train pose " << std::setw(2) << pid
+                << ": 3D RMSE=" << std::fixed << std::setprecision(5)
+                << pose_error << " mm"
+                << ", model-plane RMSE=" << diagnostics.model_plane_rmse_mm
+                << " mm"
+                << ", |n.r| median=" << diagnostics.ray_plane_denom_median
+                << ", p05=" << diagnostics.ray_plane_denom_p05
+                << ", amplification=" << diagnostics.amplification << std::endl;
     }
   }
+
   result.train_rmse_mm =
       (train_eval_count > 0)
-          ? std::sqrt(sum_train_3d_err / static_cast<double>(train_eval_count))
+          ? std::sqrt(sum_train_pose_sq / static_cast<double>(train_eval_count))
           : 0.0;
 
-  // 测试集闭环 3D 误差评估
+  double sum_test_pose_sq = 0.0;
+  int test_eval_count = 0;
+
   if (!config.test_poses.empty()) {
-    const int test_pid = config.test_poses[0];
-    if (test_pid >= 0 && test_pid < static_cast<int>(all_phase_maps.size())) {
-      const auto test_bp =
-          computeBoardPlane(camera_calib.rotation_vectors[test_pid],
-                            camera_calib.translation_vectors[test_pid]);
-      result.test_rmse_mm = evaluateMsmReconstruction(
-          result, all_phase_maps[test_pid], camera_calib.camera_matrix,
-          camera_calib.distortion_coefficients, test_bp, eff_min_psi,
-          eff_max_psi, 4);
+    std::cout << "\n[Step 6] Reconstruction diagnostics on test poses:"
+              << std::endl;
+  }
+
+  for (const int test_pid : config.test_poses) {
+    if (test_pid < 0 || test_pid >= static_cast<int>(all_phase_maps.size()) ||
+        test_pid >= static_cast<int>(camera_calib.rotation_vectors.size()) ||
+        test_pid >= static_cast<int>(camera_calib.translation_vectors.size()) ||
+        all_phase_maps[static_cast<std::size_t>(test_pid)].empty()) {
+      std::cout << "  test pose " << test_pid
+                << ": skipped (invalid or missing data)" << std::endl;
+      continue;
+    }
+
+    const auto test_board_plane =
+        computeBoardPlane(camera_calib.rotation_vectors[test_pid],
+                          camera_calib.translation_vectors[test_pid]);
+
+    const auto diagnostics = evaluateReconstructionDetailed(
+        result, all_phase_maps[static_cast<std::size_t>(test_pid)],
+        camera_calib.camera_matrix, camera_calib.distortion_coefficients,
+        test_board_plane, eff_min_psi, eff_max_psi, 4,
+        config.options.diagnostic_phase_bins);
+
+    const double pose_error = diagnostics.rmse_3d_mm;
+
+    if (pose_error > 0.0 && std::isfinite(pose_error)) {
+      sum_test_pose_sq += pose_error * pose_error;
+      ++test_eval_count;
+
+      std::cout << "  test pose " << std::setw(2) << test_pid
+                << ": 3D RMSE=" << std::fixed << std::setprecision(5)
+                << pose_error << " mm"
+                << ", model-plane RMSE=" << diagnostics.model_plane_rmse_mm
+                << " mm"
+                << ", |n.r| median=" << diagnostics.ray_plane_denom_median
+                << ", p05=" << diagnostics.ray_plane_denom_p05
+                << ", amplification=" << diagnostics.amplification << std::endl;
+      printPhaseBinDiagnostics(diagnostics, eff_min_psi, eff_max_psi);
     }
   }
+
+  result.test_rmse_mm =
+      (test_eval_count > 0)
+          ? std::sqrt(sum_test_pose_sq / static_cast<double>(test_eval_count))
+          : 0.0;
 
   std::cout << "\n================ Calibration Summary ================"
             << std::endl;
@@ -888,17 +2789,24 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
   std::cout << "Nominal Center (S0): [" << result.nominal_center_s0[0] << ", "
             << result.nominal_center_s0[1] << ", "
             << result.nominal_center_s0[2] << "] mm" << std::endl;
-  std::cout << "Rational Angle Model: tan(theta) = (psi - " << ref_psi
-            << ") / (" << result.angle_model.a1 << "*psi + "
-            << result.angle_model.a2 << ")" << std::endl;
+  std::cout << "Angle Model: rational trend";
+  if (!result.angle_model.correction_psi.empty()) {
+    std::cout << " + " << result.angle_model.correction_psi.size()
+              << "-knot residual correction";
+  }
+  std::cout << std::endl;
+  std::cout << "  tan(theta_base) = dpsi / (" << result.angle_model.b0 << " + "
+            << result.angle_model.b1 << "*dpsi), dpsi = psi - "
+            << result.angle_model.psi_ref << std::endl;
   std::cout << "Harmonic Drift Order: " << result.harmonic_drift.order
             << " (valid=" << (result.harmonic_drift.valid ? "YES" : "NO") << ")"
             << std::endl;
+
   if (result.harmonic_drift.valid && result.harmonic_drift.order > 0) {
-    std::cout << "Harmonic DC Offset: c_u = " << result.harmonic_drift.beta_u[0]
-              << " mm, c_v = " << result.harmonic_drift.beta_v[0] << " mm"
-              << std::endl;
+    std::cout << "Harmonic basis is anchored at the reference angle "
+              << "(delta S(0) = 0)." << std::endl;
   }
+
   std::cout << "Closed-Loop TRAIN 3D RMSE: " << result.train_rmse_mm << " mm"
             << std::endl;
   std::cout << "Closed-Loop TEST 3D RMSE:  " << result.test_rmse_mm << " mm"
@@ -908,11 +2816,12 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
 
   return result;
 }
-
 bool saveMsmCalibrationResult(const std::string& file_path,
                               const MsmCalibrationResult& result) {
   cv::FileStorage fs(file_path, cv::FileStorage::WRITE);
-  if (!fs.isOpened()) return false;
+  if (!fs.isOpened()) {
+    return false;
+  }
 
   fs << "nominal_axis_w" << cv::Mat(result.nominal_axis_w);
   fs << "nominal_center_s0" << cv::Mat(result.nominal_center_s0);
@@ -921,10 +2830,13 @@ bool saveMsmCalibrationResult(const std::string& file_path,
   fs << "basis_v" << cv::Mat(result.basis_v);
 
   fs << "psi_ref" << result.angle_model.psi_ref;
-  fs << "angle_model_a1" << result.angle_model.a1;
-  fs << "angle_model_a2" << result.angle_model.a2;
+  fs << "angle_model_b0" << result.angle_model.b0;
+  fs << "angle_model_b1" << result.angle_model.b1;
+  fs << "angle_correction_psi" << result.angle_model.correction_psi;
+  fs << "angle_correction_alpha" << result.angle_model.correction_alpha;
 
   fs << "harmonic_order" << result.harmonic_drift.order;
+  fs << "harmonic_basis" << "anchored_cos_minus_one";
   fs << "beta_u" << result.harmonic_drift.beta_u;
   fs << "beta_v" << result.harmonic_drift.beta_v;
 
@@ -941,8 +2853,12 @@ MsmCalibrationResult loadMsmCalibrationResult(const std::string& file_path) {
     throw std::runtime_error("Cannot open MSM result file: " + file_path);
   }
 
-  MsmCalibrationResult res;
-  cv::Mat w_mat, s0_mat, n0_mat, u_mat, v_mat;
+  MsmCalibrationResult result;
+  cv::Mat w_mat;
+  cv::Mat s0_mat;
+  cv::Mat n0_mat;
+  cv::Mat u_mat;
+  cv::Mat v_mat;
 
   fs["nominal_axis_w"] >> w_mat;
   fs["nominal_center_s0"] >> s0_mat;
@@ -950,27 +2866,110 @@ MsmCalibrationResult loadMsmCalibrationResult(const std::string& file_path) {
   fs["basis_u"] >> u_mat;
   fs["basis_v"] >> v_mat;
 
-  res.nominal_axis_w = cv::Vec3d(w_mat);
-  res.nominal_center_s0 = cv::Vec3d(s0_mat);
-  res.ref_normal_n0 = cv::Vec3d(n0_mat);
-  res.basis_u = cv::Vec3d(u_mat);
-  res.basis_v = cv::Vec3d(v_mat);
+  result.nominal_axis_w = cv::Vec3d(w_mat);
+  result.nominal_center_s0 = cv::Vec3d(s0_mat);
+  result.ref_normal_n0 = cv::Vec3d(n0_mat);
+  result.basis_u = cv::Vec3d(u_mat);
+  result.basis_v = cv::Vec3d(v_mat);
 
-  fs["psi_ref"] >> res.angle_model.psi_ref;
-  fs["angle_model_a1"] >> res.angle_model.a1;
-  fs["angle_model_a2"] >> res.angle_model.a2;
-  res.angle_model.valid = true;
+  fs["psi_ref"] >> result.angle_model.psi_ref;
 
-  fs["harmonic_order"] >> res.harmonic_drift.order;
-  fs["beta_u"] >> res.harmonic_drift.beta_u;
-  fs["beta_v"] >> res.harmonic_drift.beta_v;
-  res.harmonic_drift.valid = true;
+  const cv::FileNode b0_node = fs["angle_model_b0"];
+  const cv::FileNode b1_node = fs["angle_model_b1"];
 
-  fs["train_rmse_mm"] >> res.train_rmse_mm;
-  fs["test_rmse_mm"] >> res.test_rmse_mm;
+  if (!b0_node.empty() && !b1_node.empty()) {
+    b0_node >> result.angle_model.b0;
+    b1_node >> result.angle_model.b1;
+  } else {
+    double old_a1 = 0.0;
+    double old_a2 = 0.0;
+    fs["angle_model_a1"] >> old_a1;
+    fs["angle_model_a2"] >> old_a2;
+
+    result.angle_model.b1 = old_a1;
+    result.angle_model.b0 = old_a1 * result.angle_model.psi_ref + old_a2;
+  }
+
+  result.angle_model.valid = true;
+
+  const cv::FileNode angle_correction_psi_node = fs["angle_correction_psi"];
+  const cv::FileNode angle_correction_alpha_node = fs["angle_correction_alpha"];
+
+  if (!angle_correction_psi_node.empty() &&
+      !angle_correction_alpha_node.empty()) {
+    angle_correction_psi_node >> result.angle_model.correction_psi;
+    angle_correction_alpha_node >> result.angle_model.correction_alpha;
+  }
+
+  fs["harmonic_order"] >> result.harmonic_drift.order;
+
+  std::vector<double> stored_beta_u;
+  std::vector<double> stored_beta_v;
+  fs["beta_u"] >> stored_beta_u;
+  fs["beta_v"] >> stored_beta_v;
+
+  std::string harmonic_basis;
+  const cv::FileNode basis_node = fs["harmonic_basis"];
+  if (!basis_node.empty()) {
+    basis_node >> harmonic_basis;
+  }
+
+  const int order = result.harmonic_drift.order;
+  const std::size_t anchored_size =
+      static_cast<std::size_t>(std::max(0, 2 * order));
+  const std::size_t legacy_size =
+      static_cast<std::size_t>(std::max(0, 2 * order + 1));
+
+  if (harmonic_basis == "anchored_cos_minus_one" &&
+      stored_beta_u.size() == anchored_size &&
+      stored_beta_v.size() == anchored_size) {
+    result.harmonic_drift.beta_u = std::move(stored_beta_u);
+    result.harmonic_drift.beta_v = std::move(stored_beta_v);
+    result.harmonic_drift.valid = (order > 0);
+  } else if (order > 0 && stored_beta_u.size() == legacy_size &&
+             stored_beta_v.size() == legacy_size) {
+    // Legacy representation:
+    // delta = dc + sum(A_k cos(k*theta) + B_k sin(k*theta)).
+    // Move delta(0) into the reference center and convert the remaining
+    // coefficients to A_k*(cos(k*theta)-1) + B_k*sin(k*theta).
+    double delta_u_at_zero = stored_beta_u[0];
+    double delta_v_at_zero = stored_beta_v[0];
+
+    result.harmonic_drift.beta_u.assign(anchored_size, 0.0);
+    result.harmonic_drift.beta_v.assign(anchored_size, 0.0);
+
+    for (int k = 1; k <= order; ++k) {
+      const int legacy_idx = 1 + 2 * (k - 1);
+      const int anchored_idx = 2 * (k - 1);
+
+      const double au = stored_beta_u[legacy_idx];
+      const double bu = stored_beta_u[legacy_idx + 1];
+      const double av = stored_beta_v[legacy_idx];
+      const double bv = stored_beta_v[legacy_idx + 1];
+
+      delta_u_at_zero += au;
+      delta_v_at_zero += av;
+
+      result.harmonic_drift.beta_u[anchored_idx] = au;
+      result.harmonic_drift.beta_u[anchored_idx + 1] = bu;
+      result.harmonic_drift.beta_v[anchored_idx] = av;
+      result.harmonic_drift.beta_v[anchored_idx + 1] = bv;
+    }
+
+    result.nominal_center_s0 +=
+        delta_u_at_zero * result.basis_u + delta_v_at_zero * result.basis_v;
+    result.harmonic_drift.valid = true;
+  } else {
+    result.harmonic_drift.beta_u.clear();
+    result.harmonic_drift.beta_v.clear();
+    result.harmonic_drift.valid = false;
+  }
+
+  fs["train_rmse_mm"] >> result.train_rmse_mm;
+  fs["test_rmse_mm"] >> result.test_rmse_mm;
 
   fs.release();
-  return res;
+  return result;
 }
 
 }  // namespace msm3d

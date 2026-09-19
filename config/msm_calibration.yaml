@@ -3,25 +3,70 @@ dataset:
   extension: ".bmp"
   pose_count: 27
   camera_param_file: "./output/camera_calibration/camera_calibration.yml"
-  train_poses: [5, 7, 14, 17]
-  test_poses: [2]
+  train_poses: [7, 8, 10, 11, 16]
+  test_poses: [2, 6]  # pose 21 has a known abnormal phase map; evaluate it separately
 
 phase:
   frequencies: [60, 55, 51]
   steps: 24
+
   min_modulation: 8.0
+  max_fit_residual_ratio: 0.35
+  max_frequency_consistency_rad: 0.25
+  max_saturation_fraction: 0.25
+
+  enable_multifrequency_fusion: false
+  fusion_fit_residual_floor: 0.03
+
+  # A/B choices: "none", "median", "local_plane".
+  phase_filter: "median"
   median_filter_size: 3
+  local_plane_filter_size: 3
+  local_plane_min_valid_neighbors: 5
+  local_plane_robust_scale_rad: 0.10
+
+  save_confidence_map: true
 
 msm_calibration:
   auto_phase_range: true
   min_covisible_poses: 4
   min_psi: 25.0
   max_psi: 160.0
-  plane_count: 80                 # 采样等相位平面的离散数量
-  harmonic_order: 2              # 低阶谐波阶数
-  min_spread_ratio: 0.02         # 空间展宽比阈值 (lambda2 / lambda1)
-  max_thickness_ratio: 0.005     # 厚度比阈值 (lambda3 / lambda2)
-  max_plane_rms_mm: 0.5          # 单平面 Huber 拟合 RMS 门限 (mm)
+  plane_count: 80
+  harmonic_order: 2
+  angle_resampling_iterations: 3
+  angle_resampling_tolerance: 0.01
+
+  angle_correction_enabled: false
+  angle_correction_knots: 9
+  angle_correction_smoothness: 10.0
+  angle_correction_max_abs_mrad: 2.5
+
+  # Local linear fit for iso-phase subpixel extraction.
+  # For each row, fit psi(x) = a*x + b in a local neighborhood around
+  # the target-phase crossing, then solve x = (psi_target - b) / a.
+  iso_fit_half_window: 2
+  min_local_phase_gradient: 0.01
+  max_local_phase_gradient: 0.5
+  max_lateral_jump_px: 5.0
+
+  # A pose contributes to a discrete light plane only when it has enough
+  # valid 3D samples. Inside robust plane fitting, every contributing pose
+  # has the same total base weight, regardless of its number of pixels.
+  min_points_per_pose: 30
+
+  # Robust plane quality.
+  plane_inlier_threshold_mm: 0.8
+  min_spread_ratio: 0.02
+  # Broad hard limit. Thickness below this limit contributes through a soft
+  # confidence term rather than a binary accept/reject decision.
+  max_thickness_ratio: 0.1
+  thickness_soft_scale: 0.02
+  max_plane_rms_mm: 0.5
+
+  plane_confidence_rms_floor_mm: 0.05
+  harmonic_regularization: 1.0e-3
+  diagnostic_phase_bins: 10
 
 output:
   phase_folder: "./output/phase"

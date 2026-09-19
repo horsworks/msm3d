@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
@@ -28,7 +29,7 @@ cv::Mat convertToGray(const cv::Mat& image) {
   }
 
   if (image.channels() == 1) {
-    return image;  // 单通道直接复用，避免整图深拷贝
+    return image;
   }
 
   cv::Mat gray;
@@ -67,6 +68,45 @@ cv::Ptr<cv::SimpleBlobDetector> createCircleDetector(
   return cv::SimpleBlobDetector::create(params);
 }
 
+double percentile(std::vector<double> values, double q) {
+  if (values.empty()) {
+    return 0.0;
+  }
+
+  q = std::clamp(q, 0.0, 1.0);
+  const double position = q * static_cast<double>(values.size() - 1);
+  const std::size_t lower = static_cast<std::size_t>(std::floor(position));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(position));
+
+  std::nth_element(values.begin(), values.begin() + lower, values.end());
+  const double lower_value = values[lower];
+
+  if (upper == lower) {
+    return lower_value;
+  }
+
+  std::nth_element(values.begin(), values.begin() + upper, values.end());
+  const double upper_value = values[upper];
+  const double t = position - static_cast<double>(lower);
+  return lower_value + t * (upper_value - lower_value);
+}
+
+int makeCalibrationFlags(const CameraCalibrationOptions& options) {
+  int flags = 0;
+
+  if (options.fix_k3) {
+    flags |= cv::CALIB_FIX_K3;
+  }
+  if (options.zero_tangent_distortion) {
+    flags |= cv::CALIB_ZERO_TANGENT_DIST;
+  }
+  if (options.use_rational_model) {
+    flags |= cv::CALIB_RATIONAL_MODEL;
+  }
+
+  return flags;
+}
+
 }  // namespace
 
 std::vector<cv::Point3f> generateCalibrationObjectPoints(
@@ -82,8 +122,8 @@ std::vector<cv::Point3f> generateCalibrationObjectPoints(
   for (int row = 0; row < board.rows; ++row) {
     const double y = static_cast<double>(row) * board.spacing;
     for (int col = 0; col < board.columns; ++col) {
-      double x = is_asymmetric ? (2.0 * col + (row % 2)) * board.spacing
-                               : col * board.spacing;
+      const double x = is_asymmetric ? (2.0 * col + (row % 2)) * board.spacing
+                                     : col * board.spacing;
       points.emplace_back(static_cast<float>(x), static_cast<float>(y), 0.0F);
     }
   }
@@ -129,7 +169,6 @@ CalibrationDetectionResult detectCalibrationPoints(
     return result;
   }
 
-  // 尝试反色重检（应对黑底白圆与白底黑圆场景）
   cv::Mat inverted_gray;
   cv::bitwise_not(gray, inverted_gray);
 
@@ -147,7 +186,6 @@ CalibrationDetectionResult detectCalibrationPoints(
     return result;
   }
 
-  // 若均未检出完整标定板，保留斑点数量更接近期望数量的结果用于调试可视化
   const std::size_t expected_count =
       static_cast<std::size_t>(board.columns * board.rows);
   const auto orig_diff =
@@ -195,47 +233,83 @@ CameraCalibrationResult calibrateCamera(
 
   CameraCalibrationResult result;
   result.camera_matrix = cv::Mat::eye(3, 3, CV_64F);
-  result.distortion_coefficients = cv::Mat::zeros(1, 5, CV_64F);
+  result.distortion_coefficients =
+      cv::Mat::zeros(1, options.use_rational_model ? 8 : 5, CV_64F);
 
-  int calibration_flags = 0;
-  if (options.fix_k3) {
-    calibration_flags |= cv::CALIB_FIX_K3;
-  }
-
+  const int calibration_flags = makeCalibrationFlags(options);
   const cv::TermCriteria criteria(
-      cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 100, 1e-9);
+      cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 200, 1e-12);
 
+  cv::Mat opencv_per_view_errors;
   result.rms = cv::calibrateCamera(
       object_points, image_points, image_size, result.camera_matrix,
       result.distortion_coefficients, result.rotation_vectors,
-      result.translation_vectors, calibration_flags, criteria);
+      result.translation_vectors, result.intrinsic_std_deviations,
+      result.extrinsic_std_deviations, opencv_per_view_errors,
+      calibration_flags, criteria);
 
+  double total_error_sum = 0.0;
   double total_squared_error = 0.0;
   std::size_t total_point_count = 0;
+  std::vector<double> all_point_errors;
 
   result.per_view_errors.reserve(object_points.size());
+  result.per_view_mean_errors.reserve(object_points.size());
+  result.per_view_p95_errors.reserve(object_points.size());
+  result.per_view_max_errors.reserve(object_points.size());
 
   for (std::size_t i = 0; i < object_points.size(); ++i) {
     std::vector<cv::Point2f> projected_points;
-
     cv::projectPoints(object_points[i], result.rotation_vectors[i],
                       result.translation_vectors[i], result.camera_matrix,
                       result.distortion_coefficients, projected_points);
 
-    const double l2_error =
-        cv::norm(image_points[i], projected_points, cv::NORM_L2);
+    std::vector<double> view_errors;
+    view_errors.reserve(projected_points.size());
 
-    const double view_error =
-        l2_error / std::sqrt(static_cast<double>(object_points[i].size()));
+    double view_error_sum = 0.0;
+    double view_squared_error = 0.0;
+    double view_max_error = 0.0;
 
-    result.per_view_errors.push_back(view_error);
+    for (std::size_t j = 0; j < projected_points.size(); ++j) {
+      const double dx =
+          static_cast<double>(image_points[i][j].x - projected_points[j].x);
+      const double dy =
+          static_cast<double>(image_points[i][j].y - projected_points[j].y);
+      const double error = std::sqrt(dx * dx + dy * dy);
 
-    total_squared_error += l2_error * l2_error;
-    total_point_count += object_points[i].size();
+      view_errors.push_back(error);
+      all_point_errors.push_back(error);
+      view_error_sum += error;
+      view_squared_error += error * error;
+      view_max_error = std::max(view_max_error, error);
+    }
+
+    const double point_count = static_cast<double>(view_errors.size());
+    result.per_view_mean_errors.push_back(view_error_sum / point_count);
+    result.per_view_errors.push_back(
+        std::sqrt(view_squared_error / point_count));
+    result.per_view_p95_errors.push_back(percentile(view_errors, 0.95));
+    result.per_view_max_errors.push_back(view_max_error);
+
+    total_error_sum += view_error_sum;
+    total_squared_error += view_squared_error;
+    total_point_count += view_errors.size();
   }
 
-  result.reprojection_error =
-      std::sqrt(total_squared_error / static_cast<double>(total_point_count));
+  if (total_point_count == 0) {
+    throw std::runtime_error(
+        "Camera calibration produced no reprojection observations.");
+  }
+
+  const double total_count = static_cast<double>(total_point_count);
+  result.mean_reprojection_error = total_error_sum / total_count;
+  result.reprojection_error = std::sqrt(total_squared_error / total_count);
+  result.p95_reprojection_error = percentile(all_point_errors, 0.95);
+  result.max_reprojection_error =
+      all_point_errors.empty()
+          ? 0.0
+          : *std::max_element(all_point_errors.begin(), all_point_errors.end());
 
   return result;
 }

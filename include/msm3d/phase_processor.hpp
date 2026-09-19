@@ -12,9 +12,6 @@ struct PhaseQualityOptions {
   double max_fit_residual_ratio = 0.35;
   double max_frequency_consistency_rad = 0.25;
   double max_saturation_fraction = 0.25;
-
-  bool enable_multifrequency_fusion = true;
-  double fusion_fit_residual_floor = 0.03;
 };
 
 struct PhaseQualitySummary {
@@ -29,9 +26,6 @@ struct PhaseQualitySummary {
   double max_frequency_consistency_rad = 0.0;
   double frequency_consistency_p95_rad = 0.0;
   double frequency_consistency_p99_rad = 0.0;
-
-  double mean_fusion_disagreement_rad = 0.0;
-  double max_fusion_disagreement_rad = 0.0;
 };
 
 class PhaseProcessor {
@@ -61,13 +55,6 @@ class PhaseProcessor {
       PhaseQualitySummary* out_summary = nullptr);
 
   static cv::Mat filterPhaseNoise(const cv::Mat& phase, int kernel_size = 3);
-
-  static cv::Mat filterPhaseLocalPlane(const cv::Mat& phase,
-                                       const cv::Mat& confidence,
-                                       int kernel_size = 3,
-                                       int min_valid_neighbors = 5,
-                                       double robust_scale_rad = 0.10,
-                                       cv::Mat* out_confidence = nullptr);
 
   static bool savePhaseEXR(const cv::Mat& phase, const std::string& filename,
                            bool compress = false);

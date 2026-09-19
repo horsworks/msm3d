@@ -34,7 +34,10 @@ circle_detector:
   blob_color: 255
 
 calibration:
+  # Baseline model. Run A/B tests by changing one option at a time.
   fix_k3: 1
+  zero_tangent_distortion: 0
+  use_rational_model: 0
 
 output:
   result_file: "output/camera_calibration/camera_calibration.yml"

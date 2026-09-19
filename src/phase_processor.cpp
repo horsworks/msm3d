@@ -81,272 +81,6 @@ double percentile(std::vector<double> values, double q) {
   return lower_value + t * (upper_value - lower_value);
 }
 
-double phaseFusionWeight(double fit_residual_ratio, double saturation_fraction,
-                         const PhaseQualityOptions& options) {
-  const double residual =
-      std::max(std::abs(fit_residual_ratio), options.fusion_fit_residual_floor);
-
-  const double saturation_score = std::clamp(
-      1.0 - saturation_fraction / options.max_saturation_fraction, 0.0, 1.0);
-
-  return saturation_score * saturation_score / (residual * residual);
-}
-
-double fuseUnwrappedPhases(double abs1, double abs2, double abs3, int f1,
-                           int f2, int f3, double fit1, double fit2,
-                           double fit3, double saturation1, double saturation2,
-                           double saturation3,
-                           const PhaseQualityOptions& options,
-                           double& out_disagreement_rad) {
-  const double a1 = 1.0;
-  const double a2 = static_cast<double>(f2) / static_cast<double>(f1);
-  const double a3 = static_cast<double>(f3) / static_cast<double>(f1);
-
-  const double w1 = phaseFusionWeight(fit1, saturation1, options);
-  const double w2 = phaseFusionWeight(fit2, saturation2, options);
-  const double w3 = phaseFusionWeight(fit3, saturation3, options);
-
-  const double denominator = w1 * a1 * a1 + w2 * a2 * a2 + w3 * a3 * a3;
-
-  if (!(denominator > 0.0) || !std::isfinite(denominator)) {
-    out_disagreement_rad = 0.0;
-    return abs1;
-  }
-
-  const double fused =
-      (w1 * a1 * abs1 + w2 * a2 * abs2 + w3 * a3 * abs3) / denominator;
-
-  const double candidate1 = abs1;
-  const double candidate2 = abs2 / a2;
-  const double candidate3 = abs3 / a3;
-
-  const double ew1 = w1 * a1 * a1;
-  const double ew2 = w2 * a2 * a2;
-  const double ew3 = w3 * a3 * a3;
-  const double effective_weight_sum = ew1 + ew2 + ew3;
-
-  const double disagreement_sq =
-      (ew1 * (candidate1 - fused) * (candidate1 - fused) +
-       ew2 * (candidate2 - fused) * (candidate2 - fused) +
-       ew3 * (candidate3 - fused) * (candidate3 - fused)) /
-      std::max(effective_weight_sum, 1e-12);
-
-  out_disagreement_rad = std::sqrt(std::max(0.0, disagreement_sq));
-  return fused;
-}
-
-bool solveLinear3x3(double matrix[3][3], double rhs[3], double solution[3]) {
-  double augmented[3][4] = {{matrix[0][0], matrix[0][1], matrix[0][2], rhs[0]},
-                            {matrix[1][0], matrix[1][1], matrix[1][2], rhs[1]},
-                            {matrix[2][0], matrix[2][1], matrix[2][2], rhs[2]}};
-
-  for (int column = 0; column < 3; ++column) {
-    int pivot = column;
-    double pivot_abs = std::abs(augmented[column][column]);
-
-    for (int row = column + 1; row < 3; ++row) {
-      const double value = std::abs(augmented[row][column]);
-      if (value > pivot_abs) {
-        pivot = row;
-        pivot_abs = value;
-      }
-    }
-
-    if (!(pivot_abs > 1e-12) || !std::isfinite(pivot_abs)) {
-      return false;
-    }
-
-    if (pivot != column) {
-      for (int k = column; k < 4; ++k) {
-        std::swap(augmented[column][k], augmented[pivot][k]);
-      }
-    }
-
-    const double divisor = augmented[column][column];
-    for (int k = column; k < 4; ++k) {
-      augmented[column][k] /= divisor;
-    }
-
-    for (int row = 0; row < 3; ++row) {
-      if (row == column) {
-        continue;
-      }
-
-      const double factor = augmented[row][column];
-      for (int k = column; k < 4; ++k) {
-        augmented[row][k] -= factor * augmented[column][k];
-      }
-    }
-  }
-
-  for (int i = 0; i < 3; ++i) {
-    solution[i] = augmented[i][3];
-    if (!std::isfinite(solution[i])) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-struct LocalPlaneFit {
-  bool valid = false;
-  double ax = 0.0;
-  double ay = 0.0;
-  double center = 0.0;
-  double weighted_rmse = 0.0;
-  double mean_confidence = 0.0;
-  int valid_count = 0;
-};
-
-LocalPlaneFit fitLocalPlane(const cv::Mat& phase, const cv::Mat& confidence,
-                            int center_x, int center_y, int radius,
-                            double robust_scale_rad, bool robust_pass,
-                            const LocalPlaneFit* initial_fit = nullptr) {
-  double sw = 0.0;
-  double sx = 0.0;
-  double sy = 0.0;
-  double sxx = 0.0;
-  double sxy = 0.0;
-  double syy = 0.0;
-  double sz = 0.0;
-  double sxz = 0.0;
-  double syz = 0.0;
-  double confidence_sum = 0.0;
-  int valid_count = 0;
-
-  for (int dy = -radius; dy <= radius; ++dy) {
-    const int y = center_y + dy;
-    if (y < 0 || y >= phase.rows) {
-      continue;
-    }
-
-    const double* phase_row = phase.ptr<double>(y);
-    const double* confidence_row = confidence.ptr<double>(y);
-
-    for (int dx = -radius; dx <= radius; ++dx) {
-      const int x = center_x + dx;
-      if (x < 0 || x >= phase.cols) {
-        continue;
-      }
-
-      const double z = phase_row[x];
-      const double input_confidence = confidence_row[x];
-
-      if (!std::isfinite(z) || !std::isfinite(input_confidence) ||
-          input_confidence <= 0.0) {
-        continue;
-      }
-
-      double weight = std::clamp(input_confidence, 0.0, 1.0);
-
-      if (robust_pass && initial_fit != nullptr && initial_fit->valid &&
-          robust_scale_rad > 0.0) {
-        const double predicted = initial_fit->ax * static_cast<double>(dx) +
-                                 initial_fit->ay * static_cast<double>(dy) +
-                                 initial_fit->center;
-        const double residual = z - predicted;
-        const double abs_residual = std::abs(residual);
-
-        if (abs_residual > robust_scale_rad) {
-          weight *= robust_scale_rad / std::max(abs_residual, 1e-12);
-        }
-      }
-
-      if (!(weight > 0.0)) {
-        continue;
-      }
-
-      const double dx_d = static_cast<double>(dx);
-      const double dy_d = static_cast<double>(dy);
-
-      sw += weight;
-      sx += weight * dx_d;
-      sy += weight * dy_d;
-      sxx += weight * dx_d * dx_d;
-      sxy += weight * dx_d * dy_d;
-      syy += weight * dy_d * dy_d;
-      sz += weight * z;
-      sxz += weight * dx_d * z;
-      syz += weight * dy_d * z;
-
-      confidence_sum += std::clamp(input_confidence, 0.0, 1.0);
-      ++valid_count;
-    }
-  }
-
-  LocalPlaneFit fit;
-  fit.valid_count = valid_count;
-
-  if (valid_count < 3 || !(sw > 0.0)) {
-    return fit;
-  }
-
-  double matrix[3][3] = {{sxx, sxy, sx}, {sxy, syy, sy}, {sx, sy, sw}};
-  double rhs[3] = {sxz, syz, sz};
-  double solution[3] = {0.0, 0.0, 0.0};
-
-  if (!solveLinear3x3(matrix, rhs, solution)) {
-    return fit;
-  }
-
-  fit.ax = solution[0];
-  fit.ay = solution[1];
-  fit.center = solution[2];
-  fit.mean_confidence = confidence_sum / static_cast<double>(valid_count);
-
-  double weighted_residual_sum_sq = 0.0;
-  double residual_weight_sum = 0.0;
-
-  for (int dy = -radius; dy <= radius; ++dy) {
-    const int y = center_y + dy;
-    if (y < 0 || y >= phase.rows) {
-      continue;
-    }
-
-    const double* phase_row = phase.ptr<double>(y);
-    const double* confidence_row = confidence.ptr<double>(y);
-
-    for (int dx = -radius; dx <= radius; ++dx) {
-      const int x = center_x + dx;
-      if (x < 0 || x >= phase.cols) {
-        continue;
-      }
-
-      const double z = phase_row[x];
-      const double input_confidence = confidence_row[x];
-
-      if (!std::isfinite(z) || !std::isfinite(input_confidence) ||
-          input_confidence <= 0.0) {
-        continue;
-      }
-
-      double weight = std::clamp(input_confidence, 0.0, 1.0);
-      const double predicted = fit.ax * static_cast<double>(dx) +
-                               fit.ay * static_cast<double>(dy) + fit.center;
-      const double residual = z - predicted;
-
-      if (robust_pass && robust_scale_rad > 0.0) {
-        const double abs_residual = std::abs(residual);
-        if (abs_residual > robust_scale_rad) {
-          weight *= robust_scale_rad / std::max(abs_residual, 1e-12);
-        }
-      }
-
-      weighted_residual_sum_sq += weight * residual * residual;
-      residual_weight_sum += weight;
-    }
-  }
-
-  if (residual_weight_sum > 0.0) {
-    fit.weighted_rmse =
-        std::sqrt(weighted_residual_sum_sq / residual_weight_sum);
-  }
-
-  fit.valid = std::isfinite(fit.center) && std::isfinite(fit.weighted_rmse);
-  return fit;
-}
-
 }  // namespace
 
 cv::Mat PhaseProcessor::computeWrappedPhase(const std::vector<cv::Mat>& images,
@@ -580,8 +314,7 @@ cv::Mat PhaseProcessor::computeAbsolutePhase(
   if (!(quality_options.min_modulation > 0.0) ||
       !(quality_options.max_fit_residual_ratio > 0.0) ||
       !(quality_options.max_frequency_consistency_rad > 0.0) ||
-      !(quality_options.max_saturation_fraction > 0.0) ||
-      !(quality_options.fusion_fit_residual_floor > 0.0)) {
+      !(quality_options.max_saturation_fraction > 0.0)) {
     throw std::invalid_argument("Phase quality thresholds must be positive.");
   }
 
@@ -596,7 +329,6 @@ cv::Mat PhaseProcessor::computeAbsolutePhase(
   summary.total_pixels = size.width * size.height;
 
   double confidence_sum = 0.0;
-  double fusion_disagreement_sum = 0.0;
   std::vector<double> consistency_errors;
   consistency_errors.reserve(static_cast<std::size_t>(size.width) *
                              static_cast<std::size_t>(size.height) / 2);
@@ -689,32 +421,7 @@ cv::Mat PhaseProcessor::computeAbsolutePhase(
         continue;
       }
 
-      double final_absolute_phase = absolute_phase_1;
-      double fusion_disagreement = 0.0;
-
-      if (quality_options.enable_multifrequency_fusion) {
-        const double expected_abs2 = absolute_phase_1 *
-                                     static_cast<double>(f2) /
-                                     static_cast<double>(f1);
-        const double expected_abs3 = absolute_phase_1 *
-                                     static_cast<double>(f3) /
-                                     static_cast<double>(f1);
-
-        const double k2 = std::round((expected_abs2 - p2) / kTwoPi);
-        const double k3 = std::round((expected_abs3 - p3) / kTwoPi);
-
-        const double absolute_phase_2 = p2 + k2 * kTwoPi;
-        const double absolute_phase_3 = p3 + k3 * kTwoPi;
-
-        final_absolute_phase = fuseUnwrappedPhases(
-            absolute_phase_1, absolute_phase_2, absolute_phase_3, f1, f2, f3,
-            r1_ptr[x], r2_ptr[x], r3_ptr[x], s1_ptr[x], s2_ptr[x], s3_ptr[x],
-            quality_options, fusion_disagreement);
-
-        fusion_disagreement_sum += fusion_disagreement;
-        summary.max_fusion_disagreement_rad =
-            std::max(summary.max_fusion_disagreement_rad, fusion_disagreement);
-      }
+      const double final_absolute_phase = absolute_phase_1;
 
       const double modulation_score = std::clamp(
           min_modulation_value / (2.0 * quality_options.min_modulation), 0.0,
@@ -745,11 +452,6 @@ cv::Mat PhaseProcessor::computeAbsolutePhase(
   if (summary.valid_pixels > 0) {
     summary.mean_confidence =
         confidence_sum / static_cast<double>(summary.valid_pixels);
-
-    if (quality_options.enable_multifrequency_fusion) {
-      summary.mean_fusion_disagreement_rad =
-          fusion_disagreement_sum / static_cast<double>(summary.valid_pixels);
-    }
   }
 
   summary.frequency_consistency_p95_rad = percentile(consistency_errors, 0.95);
@@ -830,87 +532,6 @@ cv::Mat PhaseProcessor::filterPhaseNoise(const cv::Mat& phase,
         destination_row[x] = source_row[x];
       }
     }
-  }
-
-  return filtered;
-}
-
-cv::Mat PhaseProcessor::filterPhaseLocalPlane(
-    const cv::Mat& phase, const cv::Mat& confidence, int kernel_size,
-    int min_valid_neighbors, double robust_scale_rad, cv::Mat* out_confidence) {
-  if (phase.empty() || confidence.empty() || phase.type() != CV_64F ||
-      confidence.type() != CV_64F || phase.size() != confidence.size()) {
-    throw std::invalid_argument(
-        "Local-plane phase filtering requires matching CV_64F phase and "
-        "confidence maps.");
-  }
-
-  if (kernel_size < 3 || kernel_size % 2 == 0) {
-    throw std::invalid_argument(
-        "Local-plane phase filter kernel size must be odd and >= 3.");
-  }
-
-  if (min_valid_neighbors < 3 ||
-      min_valid_neighbors > kernel_size * kernel_size) {
-    throw std::invalid_argument("Invalid local-plane minimum neighbor count.");
-  }
-
-  if (!(robust_scale_rad > 0.0)) {
-    throw std::invalid_argument("Local-plane robust scale must be positive.");
-  }
-
-  const int radius = kernel_size / 2;
-  const int full_support = kernel_size * kernel_size;
-
-  cv::Mat filtered(phase.size(), CV_64F,
-                   cv::Scalar(std::numeric_limits<double>::quiet_NaN()));
-  cv::Mat filtered_confidence = cv::Mat::zeros(phase.size(), CV_64F);
-
-  for (int y = 0; y < phase.rows; ++y) {
-    const double* source_row = phase.ptr<double>(y);
-    const double* source_confidence_row = confidence.ptr<double>(y);
-    double* destination_row = filtered.ptr<double>(y);
-    double* destination_confidence_row = filtered_confidence.ptr<double>(y);
-
-    for (int x = 0; x < phase.cols; ++x) {
-      if (!std::isfinite(source_row[x])) {
-        continue;
-      }
-
-      const LocalPlaneFit initial = fitLocalPlane(
-          phase, confidence, x, y, radius, robust_scale_rad, false, nullptr);
-
-      if (!initial.valid || initial.valid_count < min_valid_neighbors) {
-        destination_row[x] = source_row[x];
-        destination_confidence_row[x] =
-            std::clamp(source_confidence_row[x], 0.0, 1.0);
-        continue;
-      }
-
-      const LocalPlaneFit robust = fitLocalPlane(
-          phase, confidence, x, y, radius, robust_scale_rad, true, &initial);
-
-      const LocalPlaneFit& fit =
-          (robust.valid && robust.valid_count >= min_valid_neighbors) ? robust
-                                                                      : initial;
-
-      destination_row[x] = fit.center;
-
-      const double support_score =
-          std::sqrt(std::clamp(static_cast<double>(fit.valid_count) /
-                                   static_cast<double>(full_support),
-                               0.0, 1.0));
-      const double fit_score =
-          1.0 / std::sqrt(1.0 + (fit.weighted_rmse / robust_scale_rad) *
-                                    (fit.weighted_rmse / robust_scale_rad));
-
-      destination_confidence_row[x] =
-          std::clamp(fit.mean_confidence * support_score * fit_score, 0.0, 1.0);
-    }
-  }
-
-  if (out_confidence != nullptr) {
-    *out_confidence = filtered_confidence;
   }
 
   return filtered;

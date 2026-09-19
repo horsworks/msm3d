@@ -43,6 +43,8 @@ struct CircleDetectorParameters {
 
 struct CameraCalibrationOptions {
   bool fix_k3 = true;
+  bool zero_tangent_distortion = false;
+  bool use_rational_model = false;
 };
 
 struct CameraCalibrationConfig {
@@ -68,21 +70,36 @@ struct CameraCalibrationResult {
   cv::Mat distortion_coefficients;
   std::vector<cv::Mat> rotation_vectors;
   std::vector<cv::Mat> translation_vectors;
+
+  // OpenCV calibrateCamera() overall RMS return value.
   double rms = 0.0;
-  std::vector<double> per_view_errors;
+
+  // Backward-compatible field: Euclidean point-error RMS over all points.
   double reprojection_error = 0.0;
+
+  // MATLAB cameraParameters.MeanReprojectionError-compatible statistic:
+  // arithmetic mean of Euclidean reprojection distances.
+  double mean_reprojection_error = 0.0;
+  double p95_reprojection_error = 0.0;
+  double max_reprojection_error = 0.0;
+
+  // Backward-compatible per-view RMS errors.
+  std::vector<double> per_view_errors;
+  std::vector<double> per_view_mean_errors;
+  std::vector<double> per_view_p95_errors;
+  std::vector<double> per_view_max_errors;
+
+  cv::Mat intrinsic_std_deviations;
+  cv::Mat extrinsic_std_deviations;
 };
 
-// 生成标定板在局部坐标系下的 3D 物理坐标
 std::vector<cv::Point3f> generateCalibrationObjectPoints(
     const CalibrationBoard& board);
 
-// 单张图像特征点（棋盘格角点/圆心网格）检测
 CalibrationDetectionResult detectCalibrationPoints(
     const cv::Mat& image, const CalibrationBoard& board,
     const CircleDetectorParameters& detector_params);
 
-// 多视角相机张正友标定解算
 CameraCalibrationResult calibrateCamera(
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,

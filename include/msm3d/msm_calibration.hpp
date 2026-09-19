@@ -29,9 +29,6 @@ struct DiscretePlane {
   // confidences to median ~= 1 before geometry solving.
   double confidence = 1.0;
 
-  // Backward-compatible alias used by the current downstream code.
-  double weight = 1.0;
-
   int point_count = 0;
   int inlier_count = 0;
   int pose_count = 0;
@@ -43,15 +40,9 @@ struct RationalAngleModel {
   double b0 = 0.0;
   double b1 = 0.0;
 
-  // Low-degree residual correction on top of the rational trend.
-  // Runtime evaluation uses the same piecewise-linear basis used for fitting.
-  std::vector<double> correction_psi;
-  std::vector<double> correction_alpha;
-
   bool valid = false;
 
   double evaluateBase(double psi) const;
-  double evaluateCorrection(double psi) const;
   double evaluate(double psi) const;
 };
 
@@ -84,13 +75,6 @@ struct MsmCalibrationOptions {
   // Repeat uniform-optical-angle resampling until the phase samples converge.
   int angle_resampling_iterations = 3;
   double angle_resampling_tolerance = 0.01;
-
-  // Fit a small smooth residual correction after the final rational-model
-  // resampling has converged. The correction never participates in resampling.
-  bool angle_correction_enabled = true;
-  int angle_correction_knots = 9;
-  double angle_correction_smoothness = 10.0;
-  double angle_correction_max_abs_mrad = 2.5;
 
   // Local linear subpixel extraction.
   int iso_fit_half_window = 2;

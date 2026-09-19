@@ -302,14 +302,12 @@ void normalizePlaneConfidences(std::vector<DiscretePlane>& planes) {
   for (auto& plane : planes) {
     if (!plane.valid) {
       plane.confidence = 0.0;
-      plane.weight = 0.0;
       continue;
     }
 
     const double normalized =
         std::clamp(plane.confidence / median_conf, 0.1, 10.0);
     plane.confidence = normalized;
-    plane.weight = normalized;
   }
 }
 
@@ -393,326 +391,6 @@ cv::Vec3d rotateAroundAxis(const cv::Vec3d& vector, const cv::Vec3d& axis,
 
   return cv::Vec3d(output.at<double>(0), output.at<double>(1),
                    output.at<double>(2));
-}
-
-double evaluatePiecewiseLinearCorrection(const RationalAngleModel& model,
-                                         double psi) {
-  const std::size_t count = model.correction_psi.size();
-
-  if (count < 2 || model.correction_alpha.size() != count) {
-    return 0.0;
-  }
-
-  if (psi <= model.correction_psi.front()) {
-    return model.correction_alpha.front();
-  }
-
-  if (psi >= model.correction_psi.back()) {
-    return model.correction_alpha.back();
-  }
-
-  const auto upper = std::upper_bound(model.correction_psi.begin(),
-                                      model.correction_psi.end(), psi);
-
-  const std::size_t right = static_cast<std::size_t>(
-      std::distance(model.correction_psi.begin(), upper));
-  const std::size_t left = right - 1;
-
-  const double x0 = model.correction_psi[left];
-  const double x1 = model.correction_psi[right];
-  const double t = (psi - x0) / (x1 - x0);
-
-  return (1.0 - t) * model.correction_alpha[left] +
-         t * model.correction_alpha[right];
-}
-
-bool angleModelIsStrictlyMonotonic(const RationalAngleModel& model,
-                                   double min_psi, double max_psi) {
-  if (!(max_psi > min_psi)) {
-    return false;
-  }
-
-  constexpr int kSamples = 4096;
-  double previous = model.evaluate(min_psi);
-
-  if (!std::isfinite(previous)) {
-    return false;
-  }
-
-  for (int i = 1; i <= kSamples; ++i) {
-    const double ratio = static_cast<double>(i) / static_cast<double>(kSamples);
-    const double psi = min_psi + ratio * (max_psi - min_psi);
-    const double current = model.evaluate(psi);
-
-    if (!std::isfinite(current) || current <= previous) {
-      return false;
-    }
-
-    previous = current;
-  }
-
-  return true;
-}
-
-double computeAngleModelRmse(const std::vector<DiscretePlane>& planes,
-                             const std::vector<double>& thetas,
-                             const RationalAngleModel& model,
-                             double* out_max_abs_error);
-
-double computeBaseAngleModelRmse(const std::vector<DiscretePlane>& planes,
-                                 const std::vector<double>& thetas,
-                                 const RationalAngleModel& model,
-                                 double* out_max_abs_error = nullptr) {
-  double weighted_sum_sq = 0.0;
-  double weight_sum = 0.0;
-  double max_abs_error = 0.0;
-
-  for (std::size_t i = 0; i < planes.size(); ++i) {
-    if (!planes[i].valid) {
-      continue;
-    }
-
-    const double residual = thetas[i] - model.evaluateBase(planes[i].psi);
-    const double weight = std::max(planes[i].confidence, 1e-8);
-
-    weighted_sum_sq += weight * residual * residual;
-    weight_sum += weight;
-    max_abs_error = std::max(max_abs_error, std::abs(residual));
-  }
-
-  if (out_max_abs_error != nullptr) {
-    *out_max_abs_error = max_abs_error;
-  }
-
-  return (weight_sum > 0.0) ? std::sqrt(weighted_sum_sq / weight_sum) : 0.0;
-}
-
-bool fitAngleResidualCorrection(RationalAngleModel& model,
-                                const std::vector<DiscretePlane>& planes,
-                                const std::vector<double>& thetas,
-                                const MsmCalibrationOptions& options,
-                                double* out_base_rmse = nullptr,
-                                double* out_corrected_rmse = nullptr) {
-  model.correction_psi.clear();
-  model.correction_alpha.clear();
-
-  double base_max_error = 0.0;
-  const double base_rmse =
-      computeBaseAngleModelRmse(planes, thetas, model, &base_max_error);
-
-  if (out_base_rmse != nullptr) {
-    *out_base_rmse = base_rmse;
-  }
-  if (out_corrected_rmse != nullptr) {
-    *out_corrected_rmse = base_rmse;
-  }
-
-  if (!options.angle_correction_enabled) {
-    return false;
-  }
-
-  std::vector<int> valid_indices;
-  valid_indices.reserve(planes.size());
-
-  for (std::size_t i = 0; i < planes.size(); ++i) {
-    if (planes[i].valid) {
-      valid_indices.push_back(static_cast<int>(i));
-    }
-  }
-
-  const int requested_knots = std::clamp(options.angle_correction_knots, 5, 21);
-  const int knot_count =
-      std::min(requested_knots, static_cast<int>(valid_indices.size()) - 2);
-
-  if (knot_count < 5) {
-    return false;
-  }
-
-  const double min_psi =
-      planes[static_cast<std::size_t>(valid_indices.front())].psi;
-  const double max_psi =
-      planes[static_cast<std::size_t>(valid_indices.back())].psi;
-
-  if (!(max_psi > min_psi) ||
-      !(model.psi_ref > min_psi && model.psi_ref < max_psi)) {
-    return false;
-  }
-
-  // Put psi_ref exactly on one knot. The correction at this knot is fixed to
-  // zero, so alpha(psi_ref)=0 is enforced by parameterization rather than by a
-  // post-fit constant shift.
-  const int ref_index = knot_count / 2;
-  const int left_count = ref_index;
-  const int right_count = knot_count - ref_index - 1;
-
-  model.correction_psi.resize(static_cast<std::size_t>(knot_count),
-                              model.psi_ref);
-
-  for (int i = 0; i <= left_count; ++i) {
-    const double t = (left_count > 0) ? static_cast<double>(i) /
-                                            static_cast<double>(left_count)
-                                      : 1.0;
-    model.correction_psi[static_cast<std::size_t>(i)] =
-        min_psi + t * (model.psi_ref - min_psi);
-  }
-
-  for (int i = 1; i <= right_count; ++i) {
-    const double t = static_cast<double>(i) / static_cast<double>(right_count);
-    model.correction_psi[static_cast<std::size_t>(ref_index + i)] =
-        model.psi_ref + t * (max_psi - model.psi_ref);
-  }
-
-  // Eliminate the reference-knot parameter from the unknown vector.
-  const int free_count = knot_count - 1;
-  std::vector<int> knot_to_column(static_cast<std::size_t>(knot_count), -1);
-
-  int next_column = 0;
-  for (int k = 0; k < knot_count; ++k) {
-    if (k == ref_index) {
-      continue;
-    }
-    knot_to_column[static_cast<std::size_t>(k)] = next_column++;
-  }
-
-  const int data_rows = static_cast<int>(valid_indices.size());
-  const int smooth_rows = std::max(0, knot_count - 2);
-
-  cv::Mat A = cv::Mat::zeros(data_rows + smooth_rows, free_count, CV_64F);
-  cv::Mat b = cv::Mat::zeros(data_rows + smooth_rows, 1, CV_64F);
-
-  for (int row = 0; row < data_rows; ++row) {
-    const int index = valid_indices[static_cast<std::size_t>(row)];
-    const auto& plane = planes[static_cast<std::size_t>(index)];
-    const double psi = plane.psi;
-    const double residual =
-        thetas[static_cast<std::size_t>(index)] - model.evaluateBase(psi);
-    const double sqrt_weight = std::sqrt(std::max(plane.confidence, 1e-8));
-
-    auto upper = std::upper_bound(model.correction_psi.begin(),
-                                  model.correction_psi.end(), psi);
-
-    int right =
-        static_cast<int>(std::distance(model.correction_psi.begin(), upper));
-    right = std::clamp(right, 1, knot_count - 1);
-    const int left = right - 1;
-
-    const double x0 = model.correction_psi[static_cast<std::size_t>(left)];
-    const double x1 = model.correction_psi[static_cast<std::size_t>(right)];
-    const double t = std::clamp((psi - x0) / (x1 - x0), 0.0, 1.0);
-
-    const int left_column = knot_to_column[static_cast<std::size_t>(left)];
-    const int right_column = knot_to_column[static_cast<std::size_t>(right)];
-
-    if (left_column >= 0) {
-      A.at<double>(row, left_column) += sqrt_weight * (1.0 - t);
-    }
-    if (right_column >= 0) {
-      A.at<double>(row, right_column) += sqrt_weight * t;
-    }
-
-    b.at<double>(row, 0) = sqrt_weight * residual;
-  }
-
-  // Second-difference smoothness on knot values. Nonuniform knot spacing
-  // around psi_ref is mild here; this term is intentionally only a soft
-  // regularizer, not a physical model.
-  const double sqrt_smoothness =
-      std::sqrt(std::max(options.angle_correction_smoothness, 0.0));
-
-  for (int k = 1; k + 1 < knot_count; ++k) {
-    const int row = data_rows + (k - 1);
-    const int km1_col = knot_to_column[static_cast<std::size_t>(k - 1)];
-    const int k_col = knot_to_column[static_cast<std::size_t>(k)];
-    const int kp1_col = knot_to_column[static_cast<std::size_t>(k + 1)];
-
-    if (km1_col >= 0) {
-      A.at<double>(row, km1_col) += sqrt_smoothness;
-    }
-    if (k_col >= 0) {
-      A.at<double>(row, k_col) += -2.0 * sqrt_smoothness;
-    }
-    if (kp1_col >= 0) {
-      A.at<double>(row, kp1_col) += sqrt_smoothness;
-    }
-  }
-
-  cv::Mat free_parameters;
-  if (!cv::solve(A, b, free_parameters, cv::DECOMP_SVD)) {
-    model.correction_psi.clear();
-    return false;
-  }
-
-  model.correction_alpha.assign(static_cast<std::size_t>(knot_count), 0.0);
-
-  for (int k = 0; k < knot_count; ++k) {
-    const int column = knot_to_column[static_cast<std::size_t>(k)];
-
-    if (column >= 0) {
-      model.correction_alpha[static_cast<std::size_t>(k)] =
-          free_parameters.at<double>(column);
-    }
-  }
-
-  const double max_allowed = options.angle_correction_max_abs_mrad * 1e-3;
-
-  double max_abs = 0.0;
-  for (const double value : model.correction_alpha) {
-    max_abs = std::max(max_abs, std::abs(value));
-  }
-
-  if (max_abs > max_allowed && max_abs > 0.0) {
-    const double scale = max_allowed / max_abs;
-    for (double& value : model.correction_alpha) {
-      value *= scale;
-    }
-  }
-
-  // Preserve strict monotonicity of the complete mapping. If needed, shrink
-  // only the correction; the rational trend remains untouched.
-  if (!angleModelIsStrictlyMonotonic(model, min_psi, max_psi)) {
-    const std::vector<double> original = model.correction_alpha;
-    double low = 0.0;
-    double high = 1.0;
-
-    for (int iteration = 0; iteration < 50; ++iteration) {
-      const double scale = 0.5 * (low + high);
-
-      for (std::size_t i = 0; i < original.size(); ++i) {
-        model.correction_alpha[i] = scale * original[i];
-      }
-
-      if (angleModelIsStrictlyMonotonic(model, min_psi, max_psi)) {
-        low = scale;
-      } else {
-        high = scale;
-      }
-    }
-
-    for (std::size_t i = 0; i < original.size(); ++i) {
-      model.correction_alpha[i] = low * original[i];
-    }
-  }
-
-  double corrected_max_error = 0.0;
-  const double corrected_rmse =
-      computeAngleModelRmse(planes, thetas, model, &corrected_max_error);
-
-  if (out_corrected_rmse != nullptr) {
-    *out_corrected_rmse = corrected_rmse;
-  }
-
-  // A correction that does not improve the actual runtime model is rejected.
-  if (!(corrected_rmse + 1e-12 < base_rmse)) {
-    model.correction_psi.clear();
-    model.correction_alpha.clear();
-
-    if (out_corrected_rmse != nullptr) {
-      *out_corrected_rmse = base_rmse;
-    }
-    return false;
-  }
-
-  return true;
 }
 
 double invertAngleModel(const RationalAngleModel& model, double target_theta,
@@ -832,7 +510,6 @@ DiscretePlane fitOffsetForFixedNormal(const PosePointGroups& points_by_pose,
 
   if (contributing_poses <= 0 || total_points < 30) {
     plane.confidence = 0.0;
-    plane.weight = 0.0;
     return plane;
   }
 
@@ -936,10 +613,8 @@ DiscretePlane fitOffsetForFixedNormal(const PosePointGroups& points_by_pose,
   if (plane.valid) {
     plane.confidence =
         computePlaneConfidence(plane.rms_mm, plane.thickness_ratio, options);
-    plane.weight = plane.confidence;
   } else {
     plane.confidence = 0.0;
-    plane.weight = 0.0;
   }
 
   return plane;
@@ -1311,12 +986,8 @@ double RationalAngleModel::evaluateBase(double psi) const {
   return std::atan2(delta_psi, denominator);
 }
 
-double RationalAngleModel::evaluateCorrection(double psi) const {
-  return evaluatePiecewiseLinearCorrection(*this, psi);
-}
-
 double RationalAngleModel::evaluate(double psi) const {
-  return evaluateBase(psi) + evaluateCorrection(psi);
+  return evaluateBase(psi);
 }
 
 void HarmonicDriftModel::evaluate(double theta_rad, double& out_delta_u,
@@ -1785,10 +1456,8 @@ DiscretePlane fitPlaneRobustTLS(
   if (plane.valid) {
     plane.confidence =
         computePlaneConfidence(plane.rms_mm, plane.thickness_ratio, options);
-    plane.weight = plane.confidence;
   } else {
     plane.confidence = 0.0;
-    plane.weight = 0.0;
   }
 
   return plane;
@@ -2577,12 +2246,6 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
 
   printPlaneQualityDiagnostics(discrete_planes, config.options);
 
-  double base_angle_rmse = 0.0;
-  double corrected_angle_rmse = 0.0;
-  const bool angle_correction_accepted = fitAngleResidualCorrection(
-      result.angle_model, discrete_planes, thetas, config.options,
-      &base_angle_rmse, &corrected_angle_rmse);
-
   double max_angle_error = 0.0;
   const double angle_rmse = computeAngleModelRmse(
       discrete_planes, thetas, result.angle_model, &max_angle_error);
@@ -2604,26 +2267,13 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
     max_denominator = std::max(max_denominator, denominator);
   }
 
-  double max_correction_mrad = 0.0;
-  for (const double value : result.angle_model.correction_alpha) {
-    max_correction_mrad =
-        std::max(max_correction_mrad, std::abs(value) * 1000.0);
-  }
-
   std::cout << "\nAngle model diagnostics" << std::endl;
   std::cout << "  optical angle range: [" << theta_min << ", " << theta_max
             << "] rad" << std::endl;
-  std::cout << "  rational-only weighted RMSE: " << base_angle_rmse * 1000.0
-            << " mrad" << std::endl;
-  std::cout << "  corrected weighted RMSE: " << angle_rmse * 1000.0 << " mrad"
+  std::cout << "  weighted RMSE: " << angle_rmse * 1000.0 << " mrad"
             << std::endl;
   std::cout << "  maximum absolute angle residual: " << max_angle_error * 1000.0
             << " mrad" << std::endl;
-  std::cout << "  residual correction: "
-            << (angle_correction_accepted ? "accepted" : "rejected")
-            << ", knots=" << result.angle_model.correction_psi.size()
-            << ", max correction=" << max_correction_mrad << " mrad"
-            << std::endl;
   std::cout << "  denominator range: [" << min_denominator << ", "
             << max_denominator << "]" << std::endl;
   printNormalAxisDiagnostics(discrete_planes, result.nominal_axis_w);
@@ -2789,12 +2439,7 @@ MsmCalibrationResult calibrateMsm(const MsmCalibrationConfig& config,
   std::cout << "Nominal Center (S0): [" << result.nominal_center_s0[0] << ", "
             << result.nominal_center_s0[1] << ", "
             << result.nominal_center_s0[2] << "] mm" << std::endl;
-  std::cout << "Angle Model: rational trend";
-  if (!result.angle_model.correction_psi.empty()) {
-    std::cout << " + " << result.angle_model.correction_psi.size()
-              << "-knot residual correction";
-  }
-  std::cout << std::endl;
+  std::cout << "Angle Model: rational trend" << std::endl;
   std::cout << "  tan(theta_base) = dpsi / (" << result.angle_model.b0 << " + "
             << result.angle_model.b1 << "*dpsi), dpsi = psi - "
             << result.angle_model.psi_ref << std::endl;
@@ -2832,8 +2477,6 @@ bool saveMsmCalibrationResult(const std::string& file_path,
   fs << "psi_ref" << result.angle_model.psi_ref;
   fs << "angle_model_b0" << result.angle_model.b0;
   fs << "angle_model_b1" << result.angle_model.b1;
-  fs << "angle_correction_psi" << result.angle_model.correction_psi;
-  fs << "angle_correction_alpha" << result.angle_model.correction_alpha;
 
   fs << "harmonic_order" << result.harmonic_drift.order;
   fs << "harmonic_basis" << "anchored_cos_minus_one";
@@ -2891,15 +2534,6 @@ MsmCalibrationResult loadMsmCalibrationResult(const std::string& file_path) {
   }
 
   result.angle_model.valid = true;
-
-  const cv::FileNode angle_correction_psi_node = fs["angle_correction_psi"];
-  const cv::FileNode angle_correction_alpha_node = fs["angle_correction_alpha"];
-
-  if (!angle_correction_psi_node.empty() &&
-      !angle_correction_alpha_node.empty()) {
-    angle_correction_psi_node >> result.angle_model.correction_psi;
-    angle_correction_alpha_node >> result.angle_model.correction_alpha;
-  }
 
   fs["harmonic_order"] >> result.harmonic_drift.order;
 

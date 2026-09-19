@@ -20,11 +20,6 @@ int main(int argc, char** argv) {
 
   std::cout << "Found " << all_files.size() << " fringe images in directory."
             << std::endl;
-  std::cout << "Phase fusion: "
-            << (config.quality.enable_multifrequency_fusion
-                    ? "multi-frequency weighted"
-                    : "reference frequency only")
-            << std::endl;
   std::cout << "Phase filter: " << config.phase_filter << std::endl;
 
   std::filesystem::create_directories(config.output_folder);
@@ -60,14 +55,7 @@ int main(int argc, char** argv) {
             &confidence, &quality_summary);
 
     cv::Mat clean_phase;
-    cv::Mat clean_confidence = confidence.clone();
-
-    if (config.phase_filter == "local_plane") {
-      clean_phase = msm3d::PhaseProcessor::filterPhaseLocalPlane(
-          absolute_phase_raw, confidence, config.local_plane_filter_size,
-          config.local_plane_min_valid_neighbors,
-          config.local_plane_robust_scale_rad, &clean_confidence);
-    } else if (config.phase_filter == "median") {
+    if (config.phase_filter == "median") {
       clean_phase = msm3d::PhaseProcessor::filterPhaseNoise(
           absolute_phase_raw, config.median_filter_size);
     } else {
@@ -84,7 +72,7 @@ int main(int argc, char** argv) {
                                           "/confidence_pose_" +
                                           std::to_string(pid) + ".exr";
 
-      msm3d::PhaseProcessor::savePhaseEXR(clean_confidence, confidence_path);
+      msm3d::PhaseProcessor::savePhaseEXR(confidence, confidence_path);
     }
 
     const double total =
@@ -110,13 +98,6 @@ int main(int argc, char** argv) {
               << quality_summary.frequency_consistency_p99_rad << " / "
               << quality_summary.max_frequency_consistency_rad << " rad"
               << std::endl;
-
-    if (config.quality.enable_multifrequency_fusion) {
-      std::cout << "  fusion disagreement mean/max="
-                << quality_summary.mean_fusion_disagreement_rad << " / "
-                << quality_summary.max_fusion_disagreement_rad << " rad"
-                << std::endl;
-    }
 
     std::cout << "  saved: " << phase_path << std::endl;
   }

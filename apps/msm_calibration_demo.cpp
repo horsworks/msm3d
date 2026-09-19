@@ -65,8 +65,6 @@ int main(int argc, char** argv) {
   }
 
   // 4. 执行振镜系统标定与模型解算
-  std::cout << "\nStarting MSM calibration pipeline..." << std::endl;
-
   msm3d::MsmCalibrationResult result;
   try {
     result = msm3d::calibrateMsm(config, camera_calib, all_phase_maps);

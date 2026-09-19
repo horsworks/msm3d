@@ -72,11 +72,3 @@ target_link_libraries(msm_demo
     msm3d
 )
 
-add_executable(pose_optimizer 
-    apps/msm_pose_optimizer.cpp
-)
-
-target_link_libraries(pose_optimizer
-    PRIVATE
-    msm3d
-)

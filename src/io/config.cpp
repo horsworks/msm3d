@@ -123,6 +123,10 @@ CameraCalibrationConfig loadCameraCalibrationConfig(
 
   const auto calibration_node = root["calibration"];
   readField(calibration_node, "fix_k3", config.calibration.fix_k3);
+  readField(calibration_node, "zero_tangent_distortion",
+            config.calibration.zero_tangent_distortion);
+  readField(calibration_node, "use_rational_model",
+            config.calibration.use_rational_model);
 
   const auto output_node = root["output"];
   readField(output_node, "result_file", config.result_file);
@@ -172,18 +176,9 @@ PhaseConfig loadPhaseConfig(const std::string& config_path) {
             config.quality.max_frequency_consistency_rad);
   readField(phase, "max_saturation_fraction",
             config.quality.max_saturation_fraction);
-  readField(phase, "enable_multifrequency_fusion",
-            config.quality.enable_multifrequency_fusion);
-  readField(phase, "fusion_fit_residual_floor",
-            config.quality.fusion_fit_residual_floor);
 
   readField(phase, "phase_filter", config.phase_filter);
   readField(phase, "median_filter_size", config.median_filter_size);
-  readField(phase, "local_plane_filter_size", config.local_plane_filter_size);
-  readField(phase, "local_plane_min_valid_neighbors",
-            config.local_plane_min_valid_neighbors);
-  readField(phase, "local_plane_robust_scale_rad",
-            config.local_plane_robust_scale_rad);
   readField(phase, "save_confidence_map", config.save_confidence_map);
 
   const auto output = root["output"];
@@ -206,38 +201,17 @@ PhaseConfig loadPhaseConfig(const std::string& config_path) {
       !(config.quality.max_fit_residual_ratio > 0.0) ||
       !(config.quality.max_frequency_consistency_rad > 0.0) ||
       !(config.quality.max_saturation_fraction > 0.0 &&
-        config.quality.max_saturation_fraction <= 1.0) ||
-      !(config.quality.fusion_fit_residual_floor > 0.0)) {
+        config.quality.max_saturation_fraction <= 1.0)) {
     throw std::invalid_argument("Invalid phase quality thresholds.");
   }
 
-  if (config.phase_filter != "none" && config.phase_filter != "median" &&
-      config.phase_filter != "local_plane") {
-    throw std::invalid_argument(
-        "phase_filter must be one of: none, median, local_plane.");
+  if (config.phase_filter != "none" && config.phase_filter != "median") {
+    throw std::invalid_argument("phase_filter must be one of: none, median.");
   }
 
   if (config.median_filter_size < 1 || config.median_filter_size % 2 == 0) {
     throw std::invalid_argument(
         "median_filter_size must be a positive odd integer.");
-  }
-
-  if (config.local_plane_filter_size < 3 ||
-      config.local_plane_filter_size % 2 == 0) {
-    throw std::invalid_argument(
-        "local_plane_filter_size must be an odd integer >= 3.");
-  }
-
-  if (config.local_plane_min_valid_neighbors < 3 ||
-      config.local_plane_min_valid_neighbors >
-          config.local_plane_filter_size * config.local_plane_filter_size) {
-    throw std::invalid_argument(
-        "local_plane_min_valid_neighbors is outside the filter window.");
-  }
-
-  if (!(config.local_plane_robust_scale_rad > 0.0)) {
-    throw std::invalid_argument(
-        "local_plane_robust_scale_rad must be positive.");
   }
 
   return config;
@@ -256,6 +230,15 @@ CameraCalibrationResult loadCameraCalibrationResult(
   fs["distortion_coefficients"] >> result.distortion_coefficients;
   fs["rms"] >> result.rms;
   fs["reprojection_error"] >> result.reprojection_error;
+  if (!fs["mean_reprojection_error"].empty()) {
+    fs["mean_reprojection_error"] >> result.mean_reprojection_error;
+  }
+  if (!fs["p95_reprojection_error"].empty()) {
+    fs["p95_reprojection_error"] >> result.p95_reprojection_error;
+  }
+  if (!fs["max_reprojection_error"].empty()) {
+    fs["max_reprojection_error"] >> result.max_reprojection_error;
+  }
 
   const cv::FileNode rvecs_node = fs["rotation_vectors"];
   if (rvecs_node.isSeq()) {
@@ -319,14 +302,6 @@ MsmCalibrationConfig loadMsmCalibrationConfig(const std::string& config_path) {
             config.options.angle_resampling_iterations);
   readField(msm, "angle_resampling_tolerance",
             config.options.angle_resampling_tolerance);
-  readField(msm, "angle_correction_enabled",
-            config.options.angle_correction_enabled);
-  readField(msm, "angle_correction_knots",
-            config.options.angle_correction_knots);
-  readField(msm, "angle_correction_smoothness",
-            config.options.angle_correction_smoothness);
-  readField(msm, "angle_correction_max_abs_mrad",
-            config.options.angle_correction_max_abs_mrad);
 
   // Local linear iso-phase extraction.
   readField(msm, "iso_fit_half_window", config.options.iso_fit_half_window);
@@ -382,21 +357,6 @@ MsmCalibrationConfig loadMsmCalibrationConfig(const std::string& config_path) {
 
   if (!(config.options.angle_resampling_tolerance > 0.0)) {
     throw std::invalid_argument("angle_resampling_tolerance must be positive.");
-  }
-
-  if (config.options.angle_correction_knots < 5 ||
-      config.options.angle_correction_knots > 21) {
-    throw std::invalid_argument("angle_correction_knots must be in [5, 21].");
-  }
-
-  if (!(config.options.angle_correction_smoothness >= 0.0)) {
-    throw std::invalid_argument(
-        "angle_correction_smoothness must be non-negative.");
-  }
-
-  if (!(config.options.angle_correction_max_abs_mrad > 0.0)) {
-    throw std::invalid_argument(
-        "angle_correction_max_abs_mrad must be positive.");
   }
 
   if (config.options.min_covisible_poses < 1) {

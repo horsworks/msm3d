@@ -22,13 +22,9 @@ struct PhaseConfig {
   std::string output_folder;
   PhaseQualityOptions quality;
 
-  // "none", "median", or "local_plane".
-  std::string phase_filter = "local_plane";
+  // "none" or "median".
+  std::string phase_filter = "median";
   int median_filter_size = 3;
-  int local_plane_filter_size = 3;
-  int local_plane_min_valid_neighbors = 5;
-  double local_plane_robust_scale_rad = 0.10;
-
   bool save_confidence_map = true;
 };
 

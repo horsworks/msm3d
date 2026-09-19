@@ -217,56 +217,6 @@ PhaseConfig loadPhaseConfig(const std::string& config_path) {
   return config;
 }
 
-CameraCalibrationResult loadCameraCalibrationResult(
-    const std::string& result_path) {
-  cv::FileStorage fs(result_path, cv::FileStorage::READ);
-  if (!fs.isOpened()) {
-    throw std::runtime_error("Failed to open camera calibration result file: " +
-                             result_path);
-  }
-
-  CameraCalibrationResult result;
-  fs["camera_matrix"] >> result.camera_matrix;
-  fs["distortion_coefficients"] >> result.distortion_coefficients;
-  fs["rms"] >> result.rms;
-  fs["reprojection_error"] >> result.reprojection_error;
-  if (!fs["mean_reprojection_error"].empty()) {
-    fs["mean_reprojection_error"] >> result.mean_reprojection_error;
-  }
-  if (!fs["p95_reprojection_error"].empty()) {
-    fs["p95_reprojection_error"] >> result.p95_reprojection_error;
-  }
-  if (!fs["max_reprojection_error"].empty()) {
-    fs["max_reprojection_error"] >> result.max_reprojection_error;
-  }
-
-  const cv::FileNode rvecs_node = fs["rotation_vectors"];
-  if (rvecs_node.isSeq()) {
-    for (const auto& node : rvecs_node) {
-      cv::Mat rvec;
-      node >> rvec;
-      result.rotation_vectors.push_back(rvec);
-    }
-  }
-
-  const cv::FileNode tvecs_node = fs["translation_vectors"];
-  if (tvecs_node.isSeq()) {
-    for (const auto& node : tvecs_node) {
-      cv::Mat tvec;
-      node >> tvec;
-      result.translation_vectors.push_back(tvec);
-    }
-  }
-
-  if (result.camera_matrix.empty() || result.distortion_coefficients.empty()) {
-    throw std::runtime_error(
-        "Invalid camera calibration file: missing camera_matrix or "
-        "distortion_coefficients.");
-  }
-
-  return result;
-}
-
 MsmCalibrationConfig loadMsmCalibrationConfig(const std::string& config_path) {
   YAML::Node root;
   try {

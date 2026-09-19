@@ -74,16 +74,12 @@ struct CameraCalibrationResult {
   // OpenCV calibrateCamera() overall RMS return value.
   double rms = 0.0;
 
-  // Backward-compatible field: Euclidean point-error RMS over all points.
+  // Euclidean point-error RMS over all observations.
   double reprojection_error = 0.0;
-
-  // MATLAB cameraParameters.MeanReprojectionError-compatible statistic:
-  // arithmetic mean of Euclidean reprojection distances.
   double mean_reprojection_error = 0.0;
   double p95_reprojection_error = 0.0;
   double max_reprojection_error = 0.0;
 
-  // Backward-compatible per-view RMS errors.
   std::vector<double> per_view_errors;
   std::vector<double> per_view_mean_errors;
   std::vector<double> per_view_p95_errors;
@@ -92,17 +88,5 @@ struct CameraCalibrationResult {
   cv::Mat intrinsic_std_deviations;
   cv::Mat extrinsic_std_deviations;
 };
-
-std::vector<cv::Point3f> generateCalibrationObjectPoints(
-    const CalibrationBoard& board);
-
-CalibrationDetectionResult detectCalibrationPoints(
-    const cv::Mat& image, const CalibrationBoard& board,
-    const CircleDetectorParameters& detector_params);
-
-CameraCalibrationResult calibrateCamera(
-    const std::vector<std::vector<cv::Point3f>>& object_points,
-    const std::vector<std::vector<cv::Point2f>>& image_points,
-    const cv::Size& image_size, const CameraCalibrationOptions& options);
 
 }  // namespace msm3d

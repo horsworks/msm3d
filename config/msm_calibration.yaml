@@ -2,7 +2,7 @@ dataset:
   fringe_folder: "./data/fringe"
   extension: ".bmp"
   pose_count: 27
-  camera_param_file: "./output/camera_calibration/camera_calibration.yml"
+  camera_param_file: "./output/camera_calibration/camera_calibration.yaml"
   train_poses: [7, 8, 10, 11, 16]
   test_poses: [2, 6]  # pose 21 has a known abnormal phase map; evaluate it separately
 

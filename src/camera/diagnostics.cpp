@@ -1,6 +1,6 @@
-#include "msm3d/camera_calibration.hpp"
-#include "msm3d/io/config.hpp"
-#include "msm3d/io/data_loader.hpp"
+#include "msm3d/camera/diagnostics.hpp"
+
+#include <opencv2/calib3d.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -9,15 +9,15 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+namespace msm3d {
 namespace {
 
-struct PointResidual {
+struct CameraPointResidual {
   std::size_t view_index = 0;
   std::size_t point_index = 0;
   int board_row = 0;
@@ -29,7 +29,7 @@ struct PointResidual {
   double error = 0.0;
 };
 
-struct ResidualStatistics {
+struct CameraResidualStatistics {
   std::size_t count = 0;
   double mean_dx = 0.0;
   double mean_dy = 0.0;
@@ -62,9 +62,9 @@ double percentile(std::vector<double> values, double q) {
   return lower_value + t * (upper_value - lower_value);
 }
 
-ResidualStatistics summarizeResiduals(
-    const std::vector<const PointResidual*>& residuals) {
-  ResidualStatistics stats;
+CameraResidualStatistics summarizeResiduals(
+    const std::vector<const CameraPointResidual*>& residuals) {
+  CameraResidualStatistics stats;
   if (residuals.empty()) {
     return stats;
   }
@@ -76,7 +76,7 @@ ResidualStatistics summarizeResiduals(
   std::vector<double> errors;
   errors.reserve(residuals.size());
 
-  for (const PointResidual* residual : residuals) {
+  for (const CameraPointResidual* residual : residuals) {
     if (residual == nullptr) {
       continue;
     }
@@ -103,9 +103,9 @@ ResidualStatistics summarizeResiduals(
   return stats;
 }
 
-ResidualStatistics summarizeResiduals(
-    const std::vector<PointResidual>& residuals) {
-  std::vector<const PointResidual*> pointers;
+CameraResidualStatistics summarizeResiduals(
+    const std::vector<CameraPointResidual>& residuals) {
+  std::vector<const CameraPointResidual*> pointers;
   pointers.reserve(residuals.size());
   for (const auto& residual : residuals) {
     pointers.push_back(&residual);
@@ -130,11 +130,11 @@ std::string csvEscape(const std::string& value) {
   return escaped;
 }
 
-std::vector<PointResidual> buildPointResiduals(
+std::vector<CameraPointResidual> buildCameraPointResiduals(
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,
-    const msm3d::CameraCalibrationResult& result,
-    const msm3d::CalibrationBoard& board) {
+    const CameraCalibrationResult& result,
+    const CalibrationBoard& board) {
   if (object_points.size() != image_points.size() ||
       object_points.size() != result.rotation_vectors.size() ||
       object_points.size() != result.translation_vectors.size()) {
@@ -143,7 +143,7 @@ std::vector<PointResidual> buildPointResiduals(
         "counts.");
   }
 
-  std::vector<PointResidual> residuals;
+  std::vector<CameraPointResidual> residuals;
   std::size_t total_points = 0;
   for (const auto& points : image_points) {
     total_points += points.size();
@@ -169,7 +169,7 @@ std::vector<PointResidual> buildPointResiduals(
     }
 
     for (std::size_t point = 0; point < image_points[view].size(); ++point) {
-      PointResidual residual;
+      CameraPointResidual residual;
       residual.view_index = view;
       residual.point_index = point;
       residual.board_row =
@@ -192,7 +192,7 @@ std::vector<PointResidual> buildPointResiduals(
   return residuals;
 }
 
-void printWorstViews(const msm3d::CameraCalibrationResult& result,
+void printWorstCameraViewsImpl(const CameraCalibrationResult& result,
                      const std::vector<std::string>& valid_view_names,
                      std::size_t max_count) {
   if (result.per_view_errors.empty()) {
@@ -223,7 +223,7 @@ void printWorstViews(const msm3d::CameraCalibrationResult& result,
   }
 }
 
-void printIntrinsicStdDeviations(const cv::Mat& stddev) {
+void printCameraIntrinsicStdDeviationsImpl(const cv::Mat& stddev) {
   if (stddev.empty() || stddev.total() < 4) {
     return;
   }
@@ -250,8 +250,8 @@ void printIntrinsicStdDeviations(const cv::Mat& stddev) {
   }
 }
 
-void printWorstBoardPoints(const std::vector<PointResidual>& residuals,
-                           const msm3d::CalibrationBoard& board,
+void printWorstBoardPoints(const std::vector<CameraPointResidual>& residuals,
+                           const CalibrationBoard& board,
                            std::size_t max_count) {
   const int point_count = board.columns * board.rows;
   if (point_count <= 0) {
@@ -262,10 +262,10 @@ void printWorstBoardPoints(const std::vector<PointResidual>& residuals,
     int point_index = 0;
     int row = 0;
     int col = 0;
-    ResidualStatistics stats;
+    CameraResidualStatistics stats;
   };
 
-  std::vector<std::vector<const PointResidual*>> grouped(
+  std::vector<std::vector<const CameraPointResidual*>> grouped(
       static_cast<std::size_t>(point_count));
   for (const auto& residual : residuals) {
     if (residual.point_index < grouped.size()) {
@@ -305,24 +305,24 @@ void printWorstBoardPoints(const std::vector<PointResidual>& residuals,
   }
 }
 
-void printWorstObservations(const std::vector<PointResidual>& residuals,
+void printWorstObservations(const std::vector<CameraPointResidual>& residuals,
                             const std::vector<std::string>& valid_view_names,
                             std::size_t max_count) {
-  std::vector<const PointResidual*> order;
+  std::vector<const CameraPointResidual*> order;
   order.reserve(residuals.size());
   for (const auto& residual : residuals) {
     order.push_back(&residual);
   }
 
   std::sort(order.begin(), order.end(),
-            [](const PointResidual* lhs, const PointResidual* rhs) {
+            [](const CameraPointResidual* lhs, const CameraPointResidual* rhs) {
               return lhs->error > rhs->error;
             });
 
   std::cout << "\nWorst individual reprojection observations:" << std::endl;
   const std::size_t count = std::min(max_count, order.size());
   for (std::size_t rank = 0; rank < count; ++rank) {
-    const PointResidual& residual = *order[rank];
+    const CameraPointResidual& residual = *order[rank];
     const std::string name =
         residual.view_index < valid_view_names.size()
             ? valid_view_names[residual.view_index]
@@ -344,7 +344,7 @@ bool writeObservationCsv(
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,
     const std::vector<std::string>& valid_view_names,
-    const msm3d::CalibrationBoard& board) {
+    const CalibrationBoard& board) {
   std::ofstream out(path);
   if (!out.is_open()) {
     return false;
@@ -377,7 +377,7 @@ bool writeObservationCsv(
 }
 
 bool writeResidualCsv(const std::filesystem::path& path,
-                      const std::vector<PointResidual>& residuals,
+                      const std::vector<CameraPointResidual>& residuals,
                       const std::vector<std::string>& valid_view_names) {
   std::ofstream out(path);
   if (!out.is_open()) {
@@ -410,14 +410,14 @@ bool writeResidualCsv(const std::filesystem::path& path,
 }
 
 bool writeGridResidualSummaryCsv(const std::filesystem::path& path,
-                                 const std::vector<PointResidual>& residuals,
-                                 const msm3d::CalibrationBoard& board) {
+                                 const std::vector<CameraPointResidual>& residuals,
+                                 const CalibrationBoard& board) {
   const int point_count = board.columns * board.rows;
   if (point_count <= 0) {
     return false;
   }
 
-  std::vector<std::vector<const PointResidual*>> grouped(
+  std::vector<std::vector<const CameraPointResidual*>> grouped(
       static_cast<std::size_t>(point_count));
   for (const auto& residual : residuals) {
     if (residual.point_index < grouped.size()) {
@@ -436,7 +436,7 @@ bool writeGridResidualSummaryCsv(const std::filesystem::path& path,
   out << std::setprecision(12);
 
   for (int index = 0; index < point_count; ++index) {
-    const ResidualStatistics stats =
+    const CameraResidualStatistics stats =
         summarizeResiduals(grouped[static_cast<std::size_t>(index)]);
     out << index << ',' << index / board.columns << ',' << index % board.columns
         << ',' << stats.count << ',' << stats.mean_dx << ',' << stats.mean_dy
@@ -448,7 +448,7 @@ bool writeGridResidualSummaryCsv(const std::filesystem::path& path,
 }
 
 bool writeImageResidualBinsCsv(const std::filesystem::path& path,
-                               const std::vector<PointResidual>& residuals,
+                               const std::vector<CameraPointResidual>& residuals,
                                const cv::Size& image_size, int bins_x,
                                int bins_y) {
   if (image_size.width <= 0 || image_size.height <= 0 || bins_x <= 0 ||
@@ -457,7 +457,7 @@ bool writeImageResidualBinsCsv(const std::filesystem::path& path,
   }
 
   const std::size_t bin_count = static_cast<std::size_t>(bins_x * bins_y);
-  std::vector<std::vector<const PointResidual*>> grouped(bin_count);
+  std::vector<std::vector<const CameraPointResidual*>> grouped(bin_count);
 
   for (const auto& residual : residuals) {
     const double normalized_x = static_cast<double>(residual.observed_point.x) /
@@ -488,7 +488,7 @@ bool writeImageResidualBinsCsv(const std::filesystem::path& path,
     for (int bin_x = 0; bin_x < bins_x; ++bin_x) {
       const std::size_t index =
           static_cast<std::size_t>(bin_y * bins_x + bin_x);
-      const ResidualStatistics stats = summarizeResiduals(grouped[index]);
+      const CameraResidualStatistics stats = summarizeResiduals(grouped[index]);
 
       const double x_min =
           static_cast<double>(bin_x) * image_size.width / bins_x;
@@ -510,18 +510,18 @@ bool writeImageResidualBinsCsv(const std::filesystem::path& path,
   return true;
 }
 
-void saveResidualDiagnostics(
+void saveCameraResidualDiagnosticsImpl(
     const std::filesystem::path& diagnostics_dir,
     const std::vector<std::vector<cv::Point3f>>& object_points,
     const std::vector<std::vector<cv::Point2f>>& image_points,
     const std::vector<std::string>& valid_view_names,
-    const msm3d::CameraCalibrationResult& result,
-    const msm3d::CalibrationBoard& board, const cv::Size& image_size) {
+    const CameraCalibrationResult& result,
+    const CalibrationBoard& board, const cv::Size& image_size) {
   std::filesystem::create_directories(diagnostics_dir);
 
-  const std::vector<PointResidual> residuals =
-      buildPointResiduals(object_points, image_points, result, board);
-  const ResidualStatistics global_stats = summarizeResiduals(residuals);
+  const std::vector<CameraPointResidual> residuals =
+      buildCameraPointResiduals(object_points, image_points, result, board);
+  const CameraResidualStatistics global_stats = summarizeResiduals(residuals);
 
   std::cout << "\nResidual field diagnostics:" << std::endl;
   std::cout << "  global mean residual vector: (" << global_stats.mean_dx
@@ -558,193 +558,28 @@ void saveResidualDiagnostics(
             << (image_bins_ok ? "" : " [FAILED]") << std::endl;
 }
 
+
 }  // namespace
 
-int main(int argc, char** argv) {
-  const std::string config_path =
-      (argc > 1) ? argv[1] : "./config/camera_calibration.yaml";
-
-  msm3d::CameraCalibrationConfig config;
-  try {
-    config = msm3d::loadCameraCalibrationConfig(config_path);
-    std::cout << "Loaded configuration from: " << config_path << std::endl;
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to load configuration: " << e.what() << std::endl;
-    return -1;
-  }
-
-  std::vector<std::string> image_paths;
-  try {
-    image_paths =
-        msm3d::DataLoader::loadCameraCalibImagePaths(config.image_dir);
-    std::cout << "Found " << image_paths.size()
-              << " calibration images in: " << config.image_dir << std::endl;
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to load calibration images: " << e.what() << std::endl;
-    return -1;
-  }
-
-  if (image_paths.empty()) {
-    std::cerr << "No valid calibration images found in: " << config.image_dir
-              << std::endl;
-    return -1;
-  }
-
-  if (config.save_detection_debug && !config.detection_dir.empty()) {
-    std::filesystem::create_directories(config.detection_dir);
-  }
-  if (config.save_blob_debug && !config.blob_dir.empty()) {
-    std::filesystem::create_directories(config.blob_dir);
-  }
-
-  const auto object_points_pattern =
-      msm3d::generateCalibrationObjectPoints(config.board);
-  const cv::Size pattern_size(config.board.columns, config.board.rows);
-
-  std::vector<std::vector<cv::Point3f>> all_object_points;
-  std::vector<std::vector<cv::Point2f>> all_image_points;
-  std::vector<std::string> valid_view_names;
-  cv::Size image_size(0, 0);
-
-  for (const auto& img_path : image_paths) {
-    cv::Mat image = cv::imread(img_path);
-    if (image.empty()) {
-      std::cerr << "Failed to read image: " << img_path << std::endl;
-      continue;
-    }
-
-    if (image_size.width == 0 && image_size.height == 0) {
-      image_size = image.size();
-    }
-
-    const auto result = msm3d::detectCalibrationPoints(image, config.board,
-                                                       config.circle_detector);
-
-    const std::string filename =
-        std::filesystem::path(img_path).filename().string();
-
-    if (result.found) {
-      all_object_points.push_back(object_points_pattern);
-      all_image_points.push_back(result.points);
-      valid_view_names.push_back(filename);
-      std::cout << "[OK] Pattern detected in: " << filename << std::endl;
-
-      if (config.save_detection_debug && !config.detection_dir.empty()) {
-        cv::Mat debug_img = image.clone();
-        cv::drawChessboardCorners(debug_img, pattern_size, result.points, true);
-        cv::imwrite(config.detection_dir + "/" + filename, debug_img);
-      }
-    } else {
-      std::cout << "[FAIL] Failed to detect pattern in: " << filename
-                << std::endl;
-    }
-
-    if (config.save_blob_debug && !config.blob_dir.empty() &&
-        !result.blob_keypoints.empty()) {
-      cv::Mat blob_img;
-      cv::drawKeypoints(image, result.blob_keypoints, blob_img,
-                        cv::Scalar(0, 0, 255),
-                        cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
-      cv::imwrite(config.blob_dir + "/" + filename, blob_img);
-    }
-  }
-
-  std::cout << "\nValid views detected: " << all_image_points.size() << " / "
-            << image_paths.size() << std::endl;
-
-  if (all_image_points.size() < 3) {
-    std::cerr << "Error: Camera calibration requires at least 3 valid views."
-              << std::endl;
-    return -1;
-  }
-
-  std::cout << "Calibration model: fix_k3=" << std::boolalpha
-            << config.calibration.fix_k3 << ", zero_tangent_distortion="
-            << config.calibration.zero_tangent_distortion
-            << ", rational_model=" << config.calibration.use_rational_model
-            << std::noboolalpha << std::endl;
-
-  std::cout << "Optimizing camera parameters..." << std::endl;
-  const auto calib_result = msm3d::calibrateCamera(
-      all_object_points, all_image_points, image_size, config.calibration);
-
-  std::cout << "\n--- Calibration Results ---" << std::endl;
-  std::cout << std::fixed << std::setprecision(6);
-  std::cout << "Image size: " << image_size.width << " x " << image_size.height
-            << std::endl;
-  std::cout << "OpenCV overall RMS: " << calib_result.rms << " px" << std::endl;
-  std::cout << "Computed Euclidean RMS: " << calib_result.reprojection_error
-            << " px" << std::endl;
-  std::cout << "Mean Euclidean reprojection error: "
-            << calib_result.mean_reprojection_error << " px" << std::endl;
-  std::cout << "P95 Euclidean reprojection error: "
-            << calib_result.p95_reprojection_error << " px" << std::endl;
-  std::cout << "Maximum Euclidean reprojection error: "
-            << calib_result.max_reprojection_error << " px" << std::endl;
-  std::cout << "Camera Matrix (K):\n"
-            << calib_result.camera_matrix << std::endl;
-  std::cout << "Distortion Coefficients (D):\n"
-            << calib_result.distortion_coefficients << std::endl;
-
-  printIntrinsicStdDeviations(calib_result.intrinsic_std_deviations);
-  printWorstViews(calib_result, valid_view_names, 10);
-
-  std::filesystem::path res_path(config.result_file);
-  if (res_path.has_parent_path()) {
-    std::filesystem::create_directories(res_path.parent_path());
-  }
-
-  const std::filesystem::path diagnostics_dir =
-      (res_path.has_parent_path() ? res_path.parent_path()
-                                  : std::filesystem::path(".")) /
-      "diagnostics";
-
-  try {
-    saveResidualDiagnostics(diagnostics_dir, all_object_points,
-                            all_image_points, valid_view_names, calib_result,
-                            config.board, image_size);
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to generate residual diagnostics: " << e.what()
-              << std::endl;
-  }
-
-  cv::FileStorage fs(config.result_file, cv::FileStorage::WRITE);
-  if (!fs.isOpened()) {
-    std::cerr << "Failed to open result file for writing: "
-              << config.result_file << std::endl;
-    return -1;
-  }
-
-  fs << "image_width" << image_size.width;
-  fs << "image_height" << image_size.height;
-  fs << "camera_matrix" << calib_result.camera_matrix;
-  fs << "distortion_coefficients" << calib_result.distortion_coefficients;
-  fs << "rotation_vectors" << calib_result.rotation_vectors;
-  fs << "translation_vectors" << calib_result.translation_vectors;
-  fs << "rms" << calib_result.rms;
-
-  // Keep the old field name and semantics for compatibility.
-  fs << "reprojection_error" << calib_result.reprojection_error;
-  fs << "mean_reprojection_error" << calib_result.mean_reprojection_error;
-  fs << "p95_reprojection_error" << calib_result.p95_reprojection_error;
-  fs << "max_reprojection_error" << calib_result.max_reprojection_error;
-  fs << "per_view_errors" << calib_result.per_view_errors;
-  fs << "per_view_mean_errors" << calib_result.per_view_mean_errors;
-  fs << "per_view_p95_errors" << calib_result.per_view_p95_errors;
-  fs << "per_view_max_errors" << calib_result.per_view_max_errors;
-  fs << "intrinsic_std_deviations" << calib_result.intrinsic_std_deviations;
-  fs << "extrinsic_std_deviations" << calib_result.extrinsic_std_deviations;
-
-  fs << "valid_view_names" << "[";
-  for (const auto& name : valid_view_names) {
-    fs << name;
-  }
-  fs << "]";
-
-  fs.release();
-
-  std::cout << "\nCalibration parameters successfully saved to: "
-            << config.result_file << std::endl;
-
-  return 0;
+void printCameraIntrinsicStdDeviations(const cv::Mat& stddev) {
+  printCameraIntrinsicStdDeviationsImpl(stddev);
 }
+
+void printWorstCameraViews(const CameraCalibrationResult& result,
+                           const std::vector<std::string>& valid_view_names,
+                           std::size_t max_count) {
+  printWorstCameraViewsImpl(result, valid_view_names, max_count);
+}
+
+void saveCameraResidualDiagnostics(
+    const std::filesystem::path& diagnostics_dir,
+    const std::vector<std::vector<cv::Point3f>>& object_points,
+    const std::vector<std::vector<cv::Point2f>>& image_points,
+    const std::vector<std::string>& valid_view_names,
+    const CameraCalibrationResult& result, const CalibrationBoard& board,
+    const cv::Size& image_size) {
+  saveCameraResidualDiagnosticsImpl(diagnostics_dir, object_points, image_points,
+                                    valid_view_names, result, board, image_size);
+}
+
+}  // namespace msm3d

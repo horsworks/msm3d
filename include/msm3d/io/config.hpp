@@ -1,8 +1,8 @@
 #pragma once
 
-#include "msm3d/camera_calibration.hpp"
-#include "msm3d/msm_calibration.hpp"
-#include "msm3d/phase_processor.hpp"
+#include "msm3d/camera/types.hpp"
+#include "msm3d/msm/types.hpp"
+#include "msm3d/phase/quality.hpp"
 
 #include <string>
 #include <vector>
@@ -30,9 +30,6 @@ struct PhaseConfig {
 
 CameraCalibrationConfig loadCameraCalibrationConfig(
     const std::string& config_path);
-
-CameraCalibrationResult loadCameraCalibrationResult(
-    const std::string& result_path);
 
 PhaseConfig loadPhaseConfig(const std::string& config_path);
 

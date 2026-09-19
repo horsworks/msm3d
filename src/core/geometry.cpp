@@ -1,4 +1,4 @@
-#include "msm3d/geometry.hpp"
+#include "msm3d/core/geometry.hpp"
 
 #include <cmath>
 

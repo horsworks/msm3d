@@ -1,6 +1,6 @@
 #include "msm3d/io/config.hpp"
 #include "msm3d/io/data_loader.hpp"
-#include "msm3d/phase_processor.hpp"
+#include "msm3d/phase/processor.hpp"
 
 #include <algorithm>
 #include <filesystem>

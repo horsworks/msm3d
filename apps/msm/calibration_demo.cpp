@@ -1,5 +1,7 @@
+#include "msm3d/camera/serialization.hpp"
 #include "msm3d/io/config.hpp"
-#include "msm3d/msm_calibration.hpp"
+#include "msm3d/msm/calibration.hpp"
+#include "msm3d/msm/serialization.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
   }
 
   // 4. 执行振镜系统标定与模型解算
+
   msm3d::MsmCalibrationResult result;
   try {
     result = msm3d::calibrateMsm(config, camera_calib, all_phase_maps);

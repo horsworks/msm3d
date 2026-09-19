@@ -1,4 +1,4 @@
-#include "msm3d/camera_calibration.hpp"
+#include "msm3d/camera/calibration.hpp"
 
 #include <algorithm>
 #include <cmath>

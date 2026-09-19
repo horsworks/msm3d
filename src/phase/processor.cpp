@@ -1,4 +1,4 @@
-#include "msm3d/phase_processor.hpp"
+#include "msm3d/phase/processor.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>

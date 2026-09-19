@@ -40,7 +40,7 @@ calibration:
   use_rational_model: 0
 
 output:
-  result_file: "output/camera_calibration/camera_calibration.yml"
+  result_file: "output/camera_calibration/camera_calibration.yaml"
   detection_dir: "output/camera_calibration/detections"
   blob_dir: "output/camera_calibration/blobs"
   save_detection_debug: 1
